@@ -1,8 +1,8 @@
-use acyclib::device::{operation::AdamConfig, DeviceBuffer};
+use acyclib::device::{DeviceBuffer, operation::AdamConfig};
 
 use crate::{
-    backend::{ops, Buffer},
     DeviceError,
+    backend::{Buffer, ops},
 };
 
 #[allow(clippy::too_many_arguments)]
@@ -27,7 +27,6 @@ pub fn adam(
             config.beta2,
             config.gradient_factor,
             config.learning_rate,
-            config.eps,
             config.denom,
             config.decay,
             min,
@@ -49,27 +48,6 @@ pub fn clip(size: usize, params: &mut Buffer<f32>, min: f32, max: f32) -> Result
 
     unsafe {
         ops::clip(size, params.mut_ptr(), min, max);
-    }
-
-    Ok(())
-}
-
-pub fn clip_with_repeated_offset(
-    rows: usize,
-    cols: usize,
-    params: &mut Buffer<f32>,
-    offset: &Buffer<f32>,
-    offset_rows: usize,
-    offset_cols: usize,
-    min: f32,
-    max: f32,
-) -> Result<(), DeviceError> {
-    if rows * cols > params.size() || offset_rows * offset_cols > offset.size() {
-        return Err(DeviceError::ExpectedIllegalAddressAccess);
-    }
-
-    unsafe {
-        ops::clip_with_repeated_offset(rows, cols, params.mut_ptr(), offset.ptr(), offset_rows, offset_cols, min, max);
     }
 
     Ok(())

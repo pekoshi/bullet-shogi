@@ -5,13 +5,16 @@ use std::{
     sync::Arc,
 };
 
-use crate::device::{
-    operation::{AdamConfig, BaseOperations},
-    tensor::DenseMatrix,
-    Device, OperationError,
+use crate::{
+    device::{
+        Device, OperationError,
+        operation::{AdamConfig, BaseOperations},
+        tensor::DenseMatrix,
+    },
+    graph::CheckpointShapeAdapter,
 };
 
-use super::{utils, OptimiserState};
+use super::{OptimiserState, utils};
 
 #[derive(Clone, Copy, Debug)]
 pub struct RAdamParams {
@@ -88,6 +91,7 @@ impl<D: Device> OptimiserState<D> for RAdam<D> {
             learning_rate: lr,
             eps: 1.0e-8,
             denom: n_sma > params.n_sma_threshold,
+
             clip: self.params.clip,
             decay: 1.0 - self.params.decay * lr,
         };
@@ -101,6 +105,10 @@ impl<D: Device> OptimiserState<D> for RAdam<D> {
         self.step = 0;
         self.momentum.set_to(0.0)?;
         self.velocity.set_to(0.0)
+    }
+
+    fn init_velocity(&mut self, value: f32) -> Result<(), D::DeviceError> {
+        self.velocity.set_to(value)
     }
 
     fn write_to_checkpoint(map: &HashMap<String, &Self>, path: &str) -> Result<(), D::DeviceError> {
@@ -121,6 +129,7 @@ impl<D: Device> OptimiserState<D> for RAdam<D> {
         map: &mut HashMap<String, &mut Self>,
         path: &str,
         old_format: bool,
+        adapter: &dyn CheckpointShapeAdapter,
     ) -> Result<(), OperationError<D::DeviceError>> {
         let paths = [format!("{path}/momentum.bin"), format!("{path}/velocity.bin")];
         let mut momentum = utils::load_weights_from_file(&paths[0], old_format);
@@ -141,13 +150,38 @@ impl<D: Device> OptimiserState<D> for RAdam<D> {
         velocity.sort_by_key(|(id, _)| id.clone());
         steps.sort_by_key(|(id, _)| id.clone());
 
+        let skip_unknown = std::env::var("BULLET_SKIP_UNKNOWN_WEIGHTS")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+
         for (((id1, mom), (id2, vel)), (id3, step)) in momentum.iter().zip(velocity.iter()).zip(steps.iter()) {
             assert_eq!(id1, id2);
             assert_eq!(id1, id3);
 
-            let single = map.get_mut(id1).unwrap();
-            single.momentum.load_from_slice(None, mom)?;
-            single.velocity.load_from_slice(None, vel)?;
+            let Some(single) = map.get_mut(id1) else {
+                if skip_unknown {
+                    eprintln!("warn: skip unknown weight in momentum.bin: {id1}");
+                    continue;
+                }
+                panic!("unknown weight in momentum.bin: {id1}");
+            };
+            // 要素数不一致は adapter (例: Direct15 head 展開) で graph 形状へ変換する。
+            // 変換できないときのみ従来どおり skip (BULLET_SKIP_UNKNOWN_WEIGHTS) / エラー。
+            let mom = match utils::adapt_to_size::<D>(adapter, id1, mom, single.momentum.size()) {
+                Ok(mom) => mom,
+                Err(_) if skip_unknown => {
+                    eprintln!(
+                        "warn: skip size-mismatch momentum weight {id1}: ckpt={} vs graph={}",
+                        mom.len(),
+                        single.momentum.size()
+                    );
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+            let vel = utils::adapt_to_size::<D>(adapter, id1, vel, single.velocity.size())?;
+            single.momentum.load_from_slice(None, &mom)?;
+            single.velocity.load_from_slice(None, &vel)?;
             single.step = *step;
         }
 

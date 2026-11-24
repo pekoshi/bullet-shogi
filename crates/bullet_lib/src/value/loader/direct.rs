@@ -19,6 +19,22 @@ pub struct DirectSequentialDataLoader {
     interleave_batches: usize,
     shuffle_each_epoch: bool,
     shuffle_seed: u64,
+    /// LMAS bit 18/19 MATE_THREAT sidecar support。
+    ///
+    /// `true` のとき、 各 `.bin` PSV file に対し同 dir の `<stem>.mate_threat.bin` を
+    /// 同 record 数で並走読み込みし、 PSV record の **byte 39 (元 padding) を上書き**する。
+    /// PSV record size は 40 byte が前提で、 size_of::<T>() != 40 の場合は patch は no-op。
+    /// sidecar が存在しない PSV file はそのまま読み込まれ (byte 39 = 0 = mate なし)、
+    /// 既存 dataset と完全 backward compat。
+    mate_threat_sidecar: bool,
+    /// 読み込みチャンク (最大 256MB) 内でレコード順を決定論的にシャッフルする。
+    ///
+    /// 逐次読みだと同一対局由来の連続局面が同じバッチに並び、バッチ内サンプルの
+    /// 相関が強く勾配品質が落ちる (nnue-pytorch はランダムサンプリングで回避)。
+    /// チャンク内 Fisher-Yates により、事前シャッフル済みでないデータでも
+    /// バッチ相関を大幅に除去する。バッチ数・レコード数は不変なので resume 互換。
+    record_shuffle: bool,
+    record_shuffle_seed: u64,
 }
 
 impl DirectSequentialDataLoader {
@@ -36,7 +52,29 @@ impl DirectSequentialDataLoader {
             interleave_batches: usize::MAX,
             shuffle_each_epoch: false,
             shuffle_seed: 0,
+            mate_threat_sidecar: false,
+            record_shuffle: false,
+            record_shuffle_seed: 0,
         }
+    }
+
+    /// 読み込みチャンク内レコードシャッフルを有効化する (決定論的、 seed 指定)。
+    pub fn with_record_shuffle(mut self, enabled: bool, seed: u64) -> Self {
+        self.record_shuffle = enabled;
+        self.record_shuffle_seed = seed;
+        self
+    }
+
+    /// LMAS bit 18/19 MATE_THREAT sidecar (= `<stem>.mate_threat.bin`) 併読を有効化する。
+    ///
+    /// `true` のとき、 PSV file に対し同 dir の sidecar (1 byte/record) を並走読みし、
+    /// PSV record byte 39 を上書きする。 sidecar が無い PSV file は graceful fallback
+    /// (= byte 39 = 0 = mate なしで既存挙動と一致)。
+    ///
+    /// `T` size が 40 byte 以外のときは patch は no-op (= LMAS bit 18/19 は PSV 専用)。
+    pub fn with_mate_threat_sidecar(mut self, enabled: bool) -> Self {
+        self.mate_threat_sidecar = enabled;
+        self
     }
 
     /// Number of batches to read from one file before switching to the next file.
@@ -129,6 +167,15 @@ fn fisher_yates_shuffle(data: &mut [usize], seed: u64) {
     }
 }
 
+/// レコード型 (任意 T) 用 Fisher-Yates。 record_shuffle で使用。
+fn fisher_yates_shuffle_records<T>(data: &mut [T], seed: u64) {
+    let mut state = seed;
+    for i in (1..data.len()).rev() {
+        let j = (xorshift64(&mut state) as usize) % (i + 1);
+        data.swap(i, j);
+    }
+}
+
 fn build_epoch_file_order(num_files: usize, shuffle_each_epoch: bool, seed: u64, epoch_idx: usize) -> Vec<usize> {
     let mut order = (0..num_files).collect::<Vec<_>>();
     if shuffle_each_epoch && num_files > 1 {
@@ -198,9 +245,12 @@ fn apply_start_skip(
 
 fn read_records_limited<T: CanBeDirectlySequentiallyLoaded, F: FnMut(&[T]) -> bool>(
     file: &mut File,
+    sidecar: Option<&mut File>,
     buf: &mut [T],
+    sidecar_buf: &mut [u8],
     batch_size: usize,
     max_records: usize,
+    record_shuffle_seed: Option<u64>,
     f: &mut F,
 ) -> ReadChunkOutcome {
     if max_records == 0 {
@@ -210,10 +260,16 @@ fn read_records_limited<T: CanBeDirectlySequentiallyLoaded, F: FnMut(&[T]) -> bo
     let mut emitted_records = 0usize;
     let mut emitted_batches = 0usize;
     let mut remaining = max_records;
+    let record_size = size_of::<T>();
+    // mate_threat sidecar (1 byte/record) は PSV record (size 40) のときのみ
+    // byte 39 を上書きする。 他の record size では sidecar データを読み込むが
+    // patch は行わない (= 安全な no-op、 既存挙動と同等)。
+    let patch_byte_39 = record_size == 40 && sidecar.is_some();
+    let mut sidecar = sidecar;
 
     while remaining > 0 {
         let to_read_records = remaining.min(buf.len());
-        let to_read_bytes = to_read_records * size_of::<T>();
+        let to_read_bytes = to_read_records * record_size;
         let byte_buf = unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr().cast::<u8>(), to_read_bytes) };
 
         let mut filled = 0usize;
@@ -229,8 +285,44 @@ fn read_records_limited<T: CanBeDirectlySequentiallyLoaded, F: FnMut(&[T]) -> bo
             break;
         }
 
-        assert_eq!(filled % size_of::<T>(), 0);
-        let len = filled / size_of::<T>();
+        assert_eq!(filled % record_size, 0);
+        let len = filled / record_size;
+
+        // sidecar (.mate_threat.bin) を len byte 並走読み込みし、 PSV byte 39 を上書き。
+        // PSV record と sidecar byte は同 index で 1:1 対応している前提 (= source 側で
+        // input PSV と同 record 数で書き出す)。 sidecar EOF (= len_read < len) は
+        // panic でなく warn 後 0 で patch して既存挙動に fallback (= record 順序不一致を
+        // 防ぐため early EOF を許容)。
+        if let Some(sc_file) = sidecar.as_deref_mut() {
+            let sc_slice = &mut sidecar_buf[..len];
+            let mut sc_filled = 0usize;
+            while sc_filled < len {
+                let cnt = sc_file.read(&mut sc_slice[sc_filled..]).unwrap_or(0);
+                if cnt == 0 {
+                    break;
+                }
+                sc_filled += cnt;
+            }
+            // 残りは 0 (mate なし) で埋める。
+            for b in sc_slice.iter_mut().skip(sc_filled) {
+                *b = 0;
+            }
+            if patch_byte_39 {
+                for (i, b) in sc_slice.iter().enumerate() {
+                    byte_buf[i * record_size + 39] = *b;
+                }
+            }
+        }
+
+        // sidecar patch 済みの読み込みチャンク内でレコード順をシャッフルする。
+        // patch (index 対応) の後、 batch 分割の前に行うので pairing は崩れない。
+        if let Some(seed) = record_shuffle_seed {
+            fisher_yates_shuffle_records(
+                &mut buf[..len],
+                seed ^ (emitted_records as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
+            );
+        }
+
         emitted_records += len;
         remaining = remaining.saturating_sub(len);
 
@@ -304,6 +396,9 @@ impl<T: CanBeDirectlySequentiallyLoaded> DataLoader<T> for DirectSequentialDataL
         let mut epoch_start_point = start_batch % batches_per_epoch;
 
         let mut buf = unsafe { zeroed_boxed_slice::<T>(cap.max(batch_size)) };
+        // sidecar 用 1 byte/record buffer。 buf と同 record 容量。 sidecar が無い場合も
+        // 確保しておく (= read_records_limited が None branch で参照しない)。
+        let mut sidecar_buf: Vec<u8> = vec![0u8; cap.max(batch_size)];
 
         'dataloading: loop {
             let order = build_epoch_file_order(infos.len(), self.shuffle_each_epoch, self.shuffle_seed, epoch_idx);
@@ -317,6 +412,34 @@ impl<T: CanBeDirectlySequentiallyLoaded> DataLoader<T> for DirectSequentialDataL
 
             let mut loader_files = infos.iter().map(|info| File::open(&info.path).unwrap()).collect::<Vec<_>>();
 
+            // mate_threat sidecar (.mate_threat.bin) を opt-in で並走読み込み用に open。
+            // sidecar が存在しない / size 不一致の場合は None (= graceful fallback、 既存
+            // dataset と backward compat)。 size 一致は record 数で判定する
+            // (= PSV records と sidecar bytes が同数であることを要求)。
+            let mut sidecar_files: Vec<Option<File>> = infos
+                .iter()
+                .map(|info| {
+                    if !self.mate_threat_sidecar {
+                        return None;
+                    }
+                    let sidecar_path = mate_threat_sidecar_path(&info.path);
+                    let sc_meta = match std::fs::metadata(&sidecar_path) {
+                        Ok(m) => m,
+                        Err(_) => return None,
+                    };
+                    let sc_size = sc_meta.len();
+                    if sc_size != info.records as u64 {
+                        eprintln!(
+                            "[DirectSequentialDataLoader] WARNING: sidecar {sidecar_path} size {sc_size} != records {} \
+                            (skipping sidecar for this file, fallback to byte 39 = 0)",
+                            info.records,
+                        );
+                        return None;
+                    }
+                    File::open(&sidecar_path).ok()
+                })
+                .collect();
+
             for (idx, file) in loader_files.iter_mut().enumerate() {
                 let records_to_skip = batch_to_record_offset(
                     cursors[idx].batches_read,
@@ -326,6 +449,10 @@ impl<T: CanBeDirectlySequentiallyLoaded> DataLoader<T> for DirectSequentialDataL
                 );
                 if records_to_skip > 0 {
                     file.seek(SeekFrom::Start((records_to_skip as u64) * data_size_u64)).unwrap();
+                    // sidecar は 1 byte/record。
+                    if let Some(sc) = sidecar_files[idx].as_mut() {
+                        sc.seek(SeekFrom::Start(records_to_skip as u64)).unwrap();
+                    }
                 }
                 cursors[idx].records_read = records_to_skip;
             }
@@ -353,8 +480,23 @@ impl<T: CanBeDirectlySequentiallyLoaded> DataLoader<T> for DirectSequentialDataL
                 let remaining_records = info.records - cursor.records_read;
                 let max_records = remaining_records.min(chunk_batches.saturating_mul(batch_size));
 
-                let outcome =
-                    read_records_limited(&mut loader_files[file_idx], &mut buf, batch_size, max_records, &mut f);
+                // record shuffle 用チャンク seed: (base seed, epoch, file, ファイル内読み込み位置)
+                // から決定論的に導出。 resume しても同じチャンクは同じ順序になる。
+                let chunk_shuffle_seed = self.record_shuffle.then(|| {
+                    epoch_seed(self.record_shuffle_seed ^ ((file_idx as u64) << 32), epoch_idx)
+                        ^ (cursor.records_read as u64)
+                });
+
+                let outcome = read_records_limited(
+                    &mut loader_files[file_idx],
+                    sidecar_files[file_idx].as_mut(),
+                    &mut buf,
+                    &mut sidecar_buf,
+                    batch_size,
+                    max_records,
+                    chunk_shuffle_seed,
+                    &mut f,
+                );
                 cursor.records_read += outcome.records;
                 cursor.batches_read += outcome.batches;
 
@@ -372,6 +514,23 @@ impl<T: CanBeDirectlySequentiallyLoaded> DataLoader<T> for DirectSequentialDataL
             epoch_idx += 1;
         }
     }
+}
+
+/// PSV path から MATE_THREAT sidecar path を導出する。
+///
+/// PSV file の拡張子を `.mate_threat.bin` に置換した path を返す。 拡張子が無い
+/// 場合は元 path に `.mate_threat.bin` を append する。
+///
+/// 例:
+/// - `data/shuffled_01.bin` → `data/shuffled_01.mate_threat.bin`
+/// - `data/raw.psv` → `data/raw.mate_threat.bin`
+/// - `data/noext` → `data/noext.mate_threat.bin`
+fn mate_threat_sidecar_path(psv_path: &str) -> String {
+    let p = std::path::Path::new(psv_path);
+    let stem = p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| psv_path.to_string());
+    let parent = p.parent().map(|d| d.to_string_lossy().into_owned()).unwrap_or_default();
+    let fname = format!("{stem}.mate_threat.bin");
+    if parent.is_empty() { fname } else { format!("{parent}/{fname}") }
 }
 
 unsafe fn zeroed_boxed_slice<T: CanBeDirectlySequentiallyLoaded>(cap: usize) -> Box<[T]> {
@@ -438,5 +597,144 @@ mod tests {
         assert_eq!(state.cursors[1].batches_read, 0);
         assert_eq!(state.order_cursor, 0);
         assert_eq!(state.first_chunk_cap, Some((0, 2)));
+    }
+
+    #[test]
+    fn mate_threat_sidecar_path_replaces_extension() {
+        // 拡張子あり: .bin / .psv は .mate_threat.bin に置換される。
+        // Path 内部 separator は OS により / or \ なので、 末尾 fname 部分のみ比較する。
+        let p = mate_threat_sidecar_path("data/shuffled_01.bin");
+        assert!(p.ends_with("shuffled_01.mate_threat.bin"), "got: {p}");
+
+        let p = mate_threat_sidecar_path("data/raw.psv");
+        assert!(p.ends_with("raw.mate_threat.bin"), "got: {p}");
+    }
+
+    #[test]
+    fn mate_threat_sidecar_path_handles_no_extension() {
+        let p = mate_threat_sidecar_path("data/noext");
+        assert!(p.ends_with("noext.mate_threat.bin"), "got: {p}");
+    }
+
+    #[test]
+    fn mate_threat_sidecar_path_no_parent_dir() {
+        // parent 無しでも crash しない。
+        let p = mate_threat_sidecar_path("only.bin");
+        assert_eq!(p, "only.mate_threat.bin");
+    }
+
+    // ───────────────────────────────────────────────────────────────────────
+    // mate_threat sidecar integration smoke (端 to 端)
+    // ───────────────────────────────────────────────────────────────────────
+
+    use std::io::Write;
+
+    /// 40 byte record × N の擬 PSV 一時 file を作成し、 byte 39 = 0 で書き込む。
+    /// 並走 sidecar (1 byte/record) は record idx mod 4 で 0/1/2/3 を循環させる。
+    fn write_fake_psv_with_sidecar(num_records: usize, tag: &str) -> (String, String, Vec<u8>) {
+        let dir = std::env::temp_dir();
+        let psv_path = dir.join(format!("bullet_smoke_{tag}.bin")).to_string_lossy().into_owned();
+        let sc_path = dir.join(format!("bullet_smoke_{tag}.mate_threat.bin")).to_string_lossy().into_owned();
+
+        // PSV: 40 byte/record、 全部 0
+        let mut psv_buf = vec![0u8; num_records * 40];
+        // record idx を byte 0 に書いて識別可能にする
+        for i in 0..num_records {
+            psv_buf[i * 40] = (i & 0xFF) as u8;
+        }
+        std::fs::File::create(&psv_path).unwrap().write_all(&psv_buf).unwrap();
+
+        // sidecar: 1 byte/record、 0..4 cycle
+        let mut sc_buf = vec![0u8; num_records];
+        for i in 0..num_records {
+            sc_buf[i] = (i % 4) as u8;
+        }
+        std::fs::File::create(&sc_path).unwrap().write_all(&sc_buf).unwrap();
+
+        (psv_path, sc_path, sc_buf)
+    }
+
+    /// 40 byte 擬 PSV 型 (sidecar patch 検証用、 trait 経由で直 read 可能)。
+    #[derive(Copy, Clone)]
+    #[repr(C)]
+    struct PsvProbe([u8; 40]);
+
+    unsafe impl CanBeDirectlySequentiallyLoaded for PsvProbe {}
+
+    #[test]
+    fn sidecar_patches_byte_39_when_enabled() {
+        let num_records = 16usize;
+        let (psv_path, sc_path, expected_sc) = write_fake_psv_with_sidecar(num_records, "patch");
+
+        let loader = DirectSequentialDataLoader::new(&[psv_path.as_str()]).with_mate_threat_sidecar(true);
+
+        let mut all: Vec<PsvProbe> = Vec::new();
+        DataLoader::<PsvProbe>::map_batches(&loader, 0, num_records, |batch| {
+            all.extend_from_slice(batch);
+            // 1 batch = 全 record なので即時 stop
+            true
+        });
+
+        assert_eq!(all.len(), num_records, "全 record が emit されること");
+        for (i, probe) in all.iter().enumerate() {
+            assert_eq!(probe.0[0], (i & 0xFF) as u8, "record idx tag in byte 0");
+            assert_eq!(probe.0[39], expected_sc[i], "byte 39 == sidecar[{i}]");
+        }
+
+        let _ = std::fs::remove_file(&psv_path);
+        let _ = std::fs::remove_file(&sc_path);
+    }
+
+    #[test]
+    fn sidecar_disabled_leaves_byte_39_zero() {
+        // sidecar file は存在しても opt-in が false なら無視される (backward compat)。
+        let num_records = 8usize;
+        let (psv_path, sc_path, _) = write_fake_psv_with_sidecar(num_records, "disabled");
+
+        let loader = DirectSequentialDataLoader::new(&[psv_path.as_str()]);
+        // .with_mate_threat_sidecar() を呼ばない → default false
+
+        let mut all: Vec<PsvProbe> = Vec::new();
+        DataLoader::<PsvProbe>::map_batches(&loader, 0, num_records, |batch| {
+            all.extend_from_slice(batch);
+            true
+        });
+
+        assert_eq!(all.len(), num_records);
+        for probe in &all {
+            assert_eq!(probe.0[39], 0, "sidecar opt-in なしなら byte 39 は元値 (0)");
+        }
+
+        let _ = std::fs::remove_file(&psv_path);
+        let _ = std::fs::remove_file(&sc_path);
+    }
+
+    #[test]
+    fn sidecar_absent_falls_back_to_zero_with_opt_in() {
+        // opt-in true でも sidecar file が無ければ graceful fallback (byte 39 = 0)。
+        let dir = std::env::temp_dir();
+        let psv_path = dir.join("bullet_smoke_absent.bin").to_string_lossy().into_owned();
+        let num_records = 4usize;
+        let mut psv_buf = vec![0u8; num_records * 40];
+        for i in 0..num_records {
+            psv_buf[i * 40] = i as u8;
+        }
+        std::fs::File::create(&psv_path).unwrap().write_all(&psv_buf).unwrap();
+        // sidecar は作らない
+
+        let loader = DirectSequentialDataLoader::new(&[psv_path.as_str()]).with_mate_threat_sidecar(true);
+
+        let mut all: Vec<PsvProbe> = Vec::new();
+        DataLoader::<PsvProbe>::map_batches(&loader, 0, num_records, |batch| {
+            all.extend_from_slice(batch);
+            true
+        });
+
+        assert_eq!(all.len(), num_records);
+        for probe in &all {
+            assert_eq!(probe.0[39], 0, "sidecar 無し → byte 39 = 0 (既存 dataset と backward compat)");
+        }
+
+        let _ = std::fs::remove_file(&psv_path);
     }
 }

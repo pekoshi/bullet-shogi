@@ -11,8 +11,12 @@ edition = { workspace = true }
 [features]
 error = []
 nccl = ["cudarc/nccl"]
+# cudnn は 1050 Ti (sm_61) で EXECUTION_FAILED するため使わない。
+# 将来 sm_70+ GPU 用に optional 残置 (default 無効)。
+cudnn = ["cudarc/cudnn"]
 
 [dependencies]
 acyclib = { workspace = true }
-cudarc = { version = "=0.17.3", features = ["cuda-version-from-build-system"] }
+cudarc = { version = "=0.17.3", features = ["cuda-version-from-build-system", "f16"] }
+half = "2"
 parking_lot = { workspace = true }

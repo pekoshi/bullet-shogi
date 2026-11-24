@@ -1,12 +1,15 @@
 use std::{collections::HashMap, sync::Arc};
 
-use crate::device::{
-    operation::{AdamConfig, BaseOperations},
-    tensor::DenseMatrix,
-    Device, OperationError,
+use crate::{
+    device::{
+        Device, OperationError,
+        operation::{AdamConfig, BaseOperations},
+        tensor::DenseMatrix,
+    },
+    graph::CheckpointShapeAdapter,
 };
 
-use super::{utils, OptimiserState};
+use super::{OptimiserState, utils};
 
 #[derive(Clone, Copy, Debug)]
 pub struct AdamWParams {
@@ -67,6 +70,7 @@ impl<D: Device> OptimiserState<D> for AdamW<D> {
             learning_rate,
             eps: 1.0e-8,
             denom: true,
+
             decay: 1.0 - self.params.decay * learning_rate,
             clip,
         };
@@ -81,6 +85,10 @@ impl<D: Device> OptimiserState<D> for AdamW<D> {
         self.velocity.set_to(0.0)
     }
 
+    fn init_velocity(&mut self, value: f32) -> Result<(), D::DeviceError> {
+        self.velocity.set_to(value)
+    }
+
     fn write_to_checkpoint(map: &HashMap<String, &Self>, path: &str) -> Result<(), D::DeviceError> {
         let momentum: Vec<_> = map.iter().map(|(id, single)| (id, &single.momentum)).collect();
         let velocity: Vec<_> = map.iter().map(|(id, single)| (id, &single.velocity)).collect();
@@ -92,6 +100,7 @@ impl<D: Device> OptimiserState<D> for AdamW<D> {
         map: &mut HashMap<String, &mut Self>,
         path: &str,
         old_format: bool,
+        adapter: &dyn CheckpointShapeAdapter,
     ) -> Result<(), OperationError<D::DeviceError>> {
         let paths = [format!("{path}/momentum.bin"), format!("{path}/velocity.bin")];
         let mut momentum = utils::load_weights_from_file(&paths[0], old_format);
@@ -104,8 +113,10 @@ impl<D: Device> OptimiserState<D> for AdamW<D> {
             assert_eq!(id1, id2);
 
             let single = map.get_mut(id1).unwrap();
-            single.momentum.load_from_slice(None, mom)?;
-            single.velocity.load_from_slice(None, vel)?;
+            let mom = utils::adapt_to_size::<D>(adapter, id1, mom, single.momentum.size())?;
+            let vel = utils::adapt_to_size::<D>(adapter, id1, vel, single.velocity.size())?;
+            single.momentum.load_from_slice(None, &mom)?;
+            single.velocity.load_from_slice(None, &vel)?;
         }
 
         Ok(())

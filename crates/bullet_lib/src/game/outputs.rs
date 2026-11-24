@@ -1,4 +1,11 @@
-use std::{path::Path, sync::OnceLock};
+use std::{
+    cell::RefCell,
+    path::Path,
+    sync::{
+        OnceLock,
+        atomic::{AtomicBool, AtomicI32, Ordering},
+    },
+};
 
 use bulletformat::{ChessBoard, chess::MarlinFormat};
 
@@ -7,11 +14,69 @@ use crate::shogi::{
     bona_piece::FE_OLD_END,
     types::{BOARD_PIECE_TYPES, HAND_PIECE_TYPES},
 };
-
 pub trait OutputBuckets<T>: Send + Sync + Copy + Default + 'static {
     const BUCKETS: usize;
 
     fn bucket(&self, pos: &T) -> u8;
+}
+
+// S2-B simplified: progress fractional alpha based stochastic bucket selection.
+// Enable: `BUCKET_SOFT_PROB=<0.0-1.0>` env var.
+// Effect: bucket = lo with prob (1 - soft_prob * alpha), else lo+1 (clamped 0..7).
+// soft_prob=0.0 (default) → original floor behaviour, no jitter.
+// soft_prob=1.0 → expected bucket = lo + alpha (true soft mixture in expectation).
+
+/// Local xorshift PRNG (inline copy of `crate::value::loader::rng::SimpleRand`).
+struct BucketRng(u64);
+
+impl BucketRng {
+    fn with_seed() -> Self {
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("Guaranteed increasing.")
+            .as_micros() as u64
+            & 0xFFFF_FFFF;
+        Self(seed.max(1))
+    }
+
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+}
+
+fn read_bucket_soft_prob() -> f32 {
+    static CACHE: OnceLock<f32> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("BUCKET_SOFT_PROB").ok().and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.0).clamp(0.0, 1.0)
+    })
+}
+
+thread_local! {
+    static BUCKET_RNG: RefCell<BucketRng> = RefCell::new(BucketRng::with_seed());
+}
+
+/// Stochastic bucket selection with fractional alpha (= S2-B simplified soft mixture).
+///
+/// `raw` is the unclamped floor(progress * NUM_BUCKETS), `alpha` is the fractional part.
+/// Returns `raw.clamp(0, max_bucket)` with probability (1 - soft_prob * alpha),
+/// otherwise (raw + 1).clamp(0, max_bucket).
+pub(crate) fn apply_soft_bucket(raw: i32, alpha: f32, max_bucket: i32) -> u8 {
+    let soft_prob = read_bucket_soft_prob();
+    if soft_prob <= 0.0 || alpha <= 0.0 {
+        return raw.clamp(0, max_bucket) as u8;
+    }
+    let r = BUCKET_RNG.with(|rng| {
+        let v = rng.borrow_mut().next();
+        (v as f32 / u64::MAX as f32).clamp(0.0, 1.0)
+    });
+    if r < soft_prob * alpha {
+        (raw + 1).clamp(0, max_bucket) as u8
+    } else {
+        raw.clamp(0, max_bucket) as u8
+    }
 }
 
 #[deprecated(note = "You do not need to specify this anymore, it is the default!")]
@@ -115,6 +180,71 @@ pub const SHOGI_PROGRESS8_NUM_BUCKETS: usize = 8;
 
 /// Number of KP-absolute weights: `81 * FE_OLD_END`.
 pub const SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS: usize = 81 * FE_OLD_END;
+
+// ===== LayerStack「進行度4区分 × 持駒量2区分」モード (P4H2) =====
+//
+// 有効時、`ShogiProgressKPAbs::bucket` は以下で LayerStack index を返す:
+//   stack = progress_bucket4 * 2 + hand_bucket2                       (0 <= stack < 8)
+//   progress_bucket4 = progress_bucket8 / 2                           (0..3)
+//   hand_bucket2     = (weighted_hand_total >= HAND_VALUE_THRESHOLDS[progress_bucket4]) ? 1 : 0
+//
+// ★案B(進行度別閾値): 進行度と持駒量は相関するため、進行度ごとに中央値付近で分割する
+//   閾値配列を採用(教師分布 novel/base 1M サンプルで確定, 2026-07-18)。
+// ★推論側 (C++ p2nnue.cpp: P2_HAND_PIECE_WEIGHT / P2_HAND_VALUE_THRESHOLD[4] /
+//   get_layer_stack_index) と持駒重み・閾値配列・比較演算子(>=)・stack 番号を完全一致させること。
+
+/// 持駒量2区分の駒重み。index は `Hand::counts` と同順
+/// (= [歩, 香, 桂, 銀, 金, 角, 飛] = HAND_PIECE_TYPES 順)。
+/// ★C++ `P2_HAND_PIECE_WEIGHT`(PieceType index 順)と同じ駒→重み対応。
+pub const HAND_PIECE_WEIGHTS: [i32; 7] = [1, 2, 2, 3, 4, 6, 7];
+
+/// 持駒量2区分の進行度別閾値(index = progress_bucket4 = 0..3)。
+/// `weighted_hand_total >= HAND_VALUE_THRESHOLDS[prog4]` で hand_bucket=1(多)。
+/// ★C++ `P2_HAND_VALUE_THRESHOLD[4]` と一致必須(唯一の集約点)。arch marker
+///   "LSMODE=P4H2:6-12-20-24," にも反映され、閾値配列違いの net は別ネット扱いとなる。
+pub const HAND_VALUE_THRESHOLDS: [i32; 4] = [6, 12, 20, 24];
+
+static LAYERSTACK_P4H2: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// LayerStack を P4H2(進行度4区分×持駒量2区分)モードに切り替える。
+///
+/// プロセス全体で共有。訓練開始前に一度だけ設定する
+/// (`ShogiProgressKPAbs::bucket` と全 input feature の bucket 算出がこれに従う)。
+pub fn set_layerstack_p4h2(enabled: bool) {
+    LAYERSTACK_P4H2.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// P4H2 モードが有効かを返す。
+pub fn layerstack_p4h2_enabled() -> bool {
+    LAYERSTACK_P4H2.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// `Hand::counts`(= [歩,香,桂,銀,金,角,飛])から重み付き持駒量を計算する純粋関数。
+///
+/// `total = Σ_i (black.counts[i] + white.counts[i]) * HAND_PIECE_WEIGHTS[i]`。
+pub fn weighted_hand_total_from_counts(black: &[u8; 7], white: &[u8; 7]) -> i32 {
+    let mut total = 0i32;
+    for (i, &w) in HAND_PIECE_WEIGHTS.iter().enumerate() {
+        total += (black[i] as i32 + white[i] as i32) * w;
+    }
+    total
+}
+
+/// 両者合計の重み付き持駒量。`total = weighted(BLACK) + weighted(WHITE)`。
+///
+/// ★C++ `weighted_hand_total` と完全一致。
+pub fn weighted_hand_total(pos: &PackedSfenValue) -> i32 {
+    let board = pos.decode();
+    weighted_hand_total_from_counts(&board.black_hand.counts, &board.white_hand.counts)
+}
+
+/// 持駒量2区分。進行度別閾値以上=1(多)、未満=0(少)。★C++ `hand_bucket2` と一致。
+///
+/// `progress_bucket4` は 0..=3。範囲外は端にクランプ(0<=prog4<4 は呼出側で保証)。
+pub fn hand_bucket2(pos: &PackedSfenValue, progress_bucket4: usize) -> u8 {
+    let thr = HAND_VALUE_THRESHOLDS[progress_bucket4.min(3)];
+    if weighted_hand_total(pos) >= thr { 1 } else { 0 }
+}
 
 static SHOGI_PROGRESS_KP_ABS_WEIGHTS: OnceLock<Box<[f32]>> = OnceLock::new();
 static SHOGI_PROGRESS_KP_ABS_ZERO_WEIGHTS: [f32; SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS] =
@@ -335,8 +465,210 @@ impl OutputBuckets<PackedSfenValue> for ShogiProgressKPAbs {
 
     fn bucket(&self, pos: &PackedSfenValue) -> u8 {
         let p = self.progress(pos);
-        let raw = (p * 8.0).floor() as i32;
-        raw.clamp(0, 7) as u8
+        let scaled = p * 8.0;
+        let raw = scaled.floor() as i32;
+        let alpha = scaled - scaled.floor();
+        let bucket8 = apply_soft_bucket(raw, alpha, 7); // 0..7
+        if layerstack_p4h2_enabled() {
+            // P4H2: 進行度8bucket を /2 で4区分へ圧縮 + 進行度別閾値の持駒量2区分。
+            // ★C++ get_layer_stack_index と完全一致。
+            let progress_bucket4 = (bucket8 / 2) as usize; // 0..3
+            let hand2 = hand_bucket2(pos, progress_bucket4) as usize;
+            (progress_bucket4 * 2 + hand2) as u8
+        } else {
+            bucket8
+        }
+    }
+}
+
+// ===== LayerStack「進行度8区分 × 持駒量2区分」モード (P8H2) =====
+//
+// P4H2(progress4×hand2=8）を進行度8区分に拡張した 16 bucket モード。
+//   stack = progress_bucket8 * 2 + hand_bucket2                       (0 <= stack < 16)
+//   progress_bucket8 = progress8kpabs と同一の進行度8区分                 (0..7)
+//   hand_bucket2     = P4H2 と同じ持駒量2区分。閾値 index は
+//                      progress_bucket4 = progress_bucket8 / 2 (0..3) で
+//                      既存 HAND_VALUE_THRESHOLDS[4] をそのまま再利用する。
+//
+// P4H2 と異なり進行度を /2 で圧縮しないため出力 bucket 数が 16 になる。したがって
+// LayerStack を 16 head で構築する専用 net が必要で、`ShogiProgressKPAbs`(8 bucket)とは
+// 別型として扱う(`const BUCKETS = 16`)。arch marker は "LSMODE=P8H2:<t0>-<t1>-<t2>-<t3>,"。
+// ★推論側 (C++ p2nnue.cpp: -DP2_LSMODE_P8H2, get_layer_stack_index, LSMODE=P8H2 marker) と
+//   進行度区分・持駒重み・閾値配列・比較演算子(>=)・`*2 + hand` の順序を完全一致させること。
+
+// ===== 案 B (Regime LayerStack)。 2026-10-07。 =====
+//   事前登録: runs/prereg/PREREG-20261007-REGIME-B.md
+//   16 bucket の第 2 軸を「持駒量」から「regime (玉周りが攻められているか)」に差し替える。
+//     regime = (bucket8 >= REGIME_MIN_PB) && (V1 >= REGIME_V1_TH)
+//     V1 = 両玉 8 近傍の空升への敵の利き数の和 (= C++ の P2Volm::value)。
+//          **step + ray** で数える (2026-10-07 に engine 400/400 一致で確定)。
+//   🚨REGIME_MIN_PB で序盤を割らない: 実測で ply 1-40 の regime 1 は 0.8% しか無く、
+//     全 bucket を割ると前半の regime 1 側に勾配が来ない (★threat_group_starved_b01)。
+//   🚨新しい型を作らず既存の 16 bucket 型の中で切り替える (generic の二重 monomorphize を避ける)。
+static REGIME_ENABLED: AtomicBool = AtomicBool::new(false);
+static REGIME_V1_TH: AtomicI32 = AtomicI32::new(3);
+static REGIME_MIN_PB: AtomicI32 = AtomicI32::new(4);
+
+/// 案 B の regime モードを有効にする (CLI から 1 度だけ呼ぶ)。
+pub fn set_regime_mode(enabled: bool, v1_th: i32, min_pb: i32) {
+    REGIME_V1_TH.store(v1_th, Ordering::Relaxed);
+    REGIME_MIN_PB.store(min_pb, Ordering::Relaxed);
+    REGIME_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+/// regime モードが有効なら (v1_th, min_pb) を返す。
+pub fn regime_mode() -> Option<(i32, i32)> {
+    if REGIME_ENABLED.load(Ordering::Relaxed) {
+        Some((REGIME_V1_TH.load(Ordering::Relaxed), REGIME_MIN_PB.load(Ordering::Relaxed)))
+    } else {
+        None
+    }
+}
+
+/// P8H2(進行度8区分 × 持駒量2区分)の出力 bucket 数。
+pub const SHOGI_PROGRESS8_HAND2_NUM_BUCKETS: usize = 16;
+
+/// LayerStack を「進行度8区分 × 持駒量2区分 = 16」で選ぶ OutputBuckets 実装。
+///
+/// `ShogiProgressKPAbs` と同じ progress.bin(共有 OnceLock)を使い、bucket 算出のみ
+/// 16 区分へ拡張する。`ShogiProgressKPAbs` の runtime グローバル(P4H2)には依存しない
+/// 自己完結型。
+#[derive(Clone, Copy, Default)]
+pub struct ShogiProgress8Hand2KPAbs;
+
+impl ShogiProgress8Hand2KPAbs {
+    /// progress.bin をロードする(`ShogiProgressKPAbs::load_from_bin` と同一の共有
+    /// OnceLock を使うため、プロセス内で1度だけ呼べる)。
+    pub fn load_from_bin(path: &Path) -> Result<Self, String> {
+        ShogiProgressKPAbs::load_from_bin(path)?;
+        Ok(Self)
+    }
+}
+
+impl OutputBuckets<PackedSfenValue> for ShogiProgress8Hand2KPAbs {
+    const BUCKETS: usize = SHOGI_PROGRESS8_HAND2_NUM_BUCKETS;
+
+    fn bucket(&self, pos: &PackedSfenValue) -> u8 {
+        // 進行度8区分は progress8kpabs と bit-identical に算出する。
+        let p = ShogiProgressKPAbs.progress(pos);
+        let scaled = p * 8.0;
+        let raw = scaled.floor() as i32;
+        let alpha = scaled - scaled.floor();
+        let bucket8 = apply_soft_bucket(raw, alpha, 7); // 0..7
+        // 持駒量2区分の閾値は P4H2 と同じく progress_bucket4 (= bucket8/2, 0..3) で引く。
+        // ★C++ get_layer_stack_index(P8H2) と完全一致: stack = bucket8*2 + hand2。
+        // 案 B (2026-10-07): regime モードなら第 2 軸を regime にする。
+        //   🚨&& の短絡で、 序盤 (bucket8 < min_pb) では V1 を**計算しない**。
+        if let Some((v1_th, min_pb)) = regime_mode() {
+            let r = if (bucket8 as i32) >= min_pb {
+                let board = crate::shogi::ShogiBoard::from_packed_sfen(pos);
+                let v1 = crate::game::inputs::board_effect_v1(&board);
+                if v1 >= v1_th { 1usize } else { 0usize }
+            } else {
+                0usize
+            };
+            return (bucket8 as usize * 2 + r) as u8; // 0..15
+        }
+        let progress_bucket4 = (bucket8 / 2) as usize; // 0..3(閾値 index のみ)
+        let hand2 = hand_bucket2(pos, progress_bucket4) as usize;
+        (bucket8 as usize * 2 + hand2) as u8 // 0..15
+    }
+}
+
+// ===== OPNARCH 案 A (2026-11-14): king bucket k9k9z (81) と k9k9z × 進行度 3 (243) =====
+//   設計書: C:/project/p2shogi/runs/prereg/DESIGN-20261114-OPNARCH-FABLE.md 2.2 章 (YO の k9k9z と同じ)。
+//   升番号は YO と同じ sq = file*9 + rank (file 0 = 1 筋 / rank 0 = 1 段)。 Inv(sq) = 80 - sq。
+//     own(sq, 持ち主) = 持ち主が先手 ? sq : Inv(sq)       (その玉の持ち主から見た座標。 自陣が 7〜9 段目)
+//     z9(sq) = r<3 → 0 / r<6 → 1 / r==6 → 2 / それ以外 → 3 + (r-7)*3 + f/3      (0..8)
+//     kz     = z9(own(手番側の玉)) * 9 + z9(own(非手番側の玉))                   (0..80)
+//     head   = kz * 3 + pb  (pb = progress8kpabs の bucket。 0..2 だけを使う)    (0..242)
+//   添字の順は YO の LayerStack と同じ「玉 → 進行度」(idx = king; idx = idx*progress数 + progress)。
+//   🚨python 側 (runs/opnarch/kb_density.py の norm / z9、 opn_static2.py) と同じ添字であること。
+//   🚨243 は序盤帯 (進行度 bucket 0-2) 専用。 学習器は `--bucket-filter` (上限 2 以下) を必須にしている。
+//     範囲外 (pb >= 3) の局面は pb = 2 の head に寄せる (学習器では filter で来ない / 推論側の目安)。
+
+/// k9k9z の 1 玉あたりの区分数。
+pub const OPN_K9Z_ZONES: usize = 9;
+/// k9k9z の bucket 数 (両玉 9 × 9)。
+pub const OPN_K9Z_NUM_BUCKETS: usize = OPN_K9Z_ZONES * OPN_K9Z_ZONES;
+
+/// 玉の升 (その玉の持ち主から見た座標) を 9 区分にする (YO の k9k9z と同じ)。
+#[inline]
+pub fn opn_z9(own_sq: crate::shogi::Square) -> usize {
+    let f = own_sq.file() as usize;
+    let r = own_sq.rank() as usize;
+    if r < 3 {
+        0
+    } else if r < 6 {
+        1
+    } else if r == 6 {
+        2
+    } else {
+        3 + (r - 7) * 3 + f / 3
+    }
+}
+
+/// k9k9z の bucket (0..80) を手番と両玉の升 (先手視点の絶対座標) から計算する。
+///
+/// 玉の升が無効 (81 以上) なら 0 を返す (学習データには現れない前提。 panic させない)。
+#[inline]
+pub fn opn_kz(side_to_move: Color, black_king_sq: crate::shogi::Square, white_king_sq: crate::shogi::Square) -> usize {
+    if !black_king_sq.is_valid() || !white_king_sq.is_valid() {
+        return 0;
+    }
+    // その玉の持ち主から見た座標: 先手玉はそのまま、 後手玉は 180 度回転。
+    let own_black = opn_z9(black_king_sq);
+    let own_white = opn_z9(white_king_sq.inverse());
+    match side_to_move {
+        Color::Black => own_black * OPN_K9Z_ZONES + own_white,
+        Color::White => own_white * OPN_K9Z_ZONES + own_black,
+    }
+}
+
+/// progress8kpabs と bit 単位で同じ進行度 8 区分 (0..7)。 `--bucket-filter` の鍵にも使う。
+///
+/// `ShogiProgressKPAbs::bucket` の P4H2 を通さない値 (= `progress8kpabs` の bucket)。
+#[inline]
+pub fn opn_progress_bucket8(pos: &PackedSfenValue) -> u8 {
+    let p = ShogiProgressKPAbs.progress(pos);
+    let scaled = p * 8.0;
+    let raw = scaled.floor() as i32;
+    let alpha = scaled - scaled.floor();
+    apply_soft_bucket(raw, alpha, 7)
+}
+
+/// LayerStack を「k9k9z (× 進行度 PROG 区分)」で選ぶ OutputBuckets 実装 (OPN 専用)。
+///
+/// - `PROG = 1`: k9k9z のみ = 81 bucket (`--bucket-mode opnk9z`、 arch marker `LSMODE=K9Z,`)。
+/// - `PROG = 3`: k9k9z × 進行度 3 = 243 bucket (`--bucket-mode opnk9zp3`、 arch marker `LSMODE=K9ZP3,`)。
+///
+/// 進行度は `ShogiProgressKPAbs` と同じ progress.bin (共有 OnceLock) を使う。
+#[derive(Clone, Copy, Default)]
+pub struct ShogiOpnK9z<const PROG: usize>;
+
+impl<const PROG: usize> ShogiOpnK9z<PROG> {
+    /// progress.bin をロードする (`ShogiProgressKPAbs::load_from_bin` と同じ共有 OnceLock)。
+    pub fn load_from_bin(path: &Path) -> Result<Self, String> {
+        ShogiProgressKPAbs::load_from_bin(path)?;
+        Ok(Self)
+    }
+
+    /// head 番号 = kz * PROG + min(pb8, PROG - 1)。 PROG = 1 なら kz。
+    #[inline]
+    pub fn head(kz: usize, progress_bucket8: u8) -> u8 {
+        debug_assert!(PROG == 1 || PROG == 3, "ShogiOpnK9z は PROG = 1 / 3 のみ");
+        (kz * PROG + (progress_bucket8 as usize).min(PROG - 1)) as u8
+    }
+}
+
+impl<const PROG: usize> OutputBuckets<PackedSfenValue> for ShogiOpnK9z<PROG> {
+    const BUCKETS: usize = OPN_K9Z_NUM_BUCKETS * PROG;
+
+    fn bucket(&self, pos: &PackedSfenValue) -> u8 {
+        let board = pos.decode();
+        let kz = opn_kz(board.side_to_move, board.black_king_sq, board.white_king_sq);
+        let pb = if PROG == 1 { 0 } else { opn_progress_bucket8(pos) };
+        Self::head(kz, pb)
     }
 }
 
@@ -632,6 +964,79 @@ mod tests {
         assert_eq!(bucket.bucket(&psv_with_ply(81)), 8);
     }
 
+    // ===== P4H2 (進行度4区分 × 持駒量2区分) =====
+
+    /// 持駒重み・進行度別閾値の契約(★推論側 C++ と一致必須)を固定する。
+    #[test]
+    fn test_p4h2_hand_weight_contract() {
+        // [歩,香,桂,銀,金,角,飛] の順。
+        assert_eq!(HAND_PIECE_WEIGHTS, [1, 2, 2, 3, 4, 6, 7]);
+        // 進行度別閾値(prog4=0..3)。C++ P2_HAND_VALUE_THRESHOLD[4] と一致。
+        assert_eq!(HAND_VALUE_THRESHOLDS, [6, 12, 20, 24]);
+    }
+
+    /// 仕様の持駒重み例。counts index = [歩,香,桂,銀,金,角,飛]。
+    #[test]
+    fn test_p4h2_weighted_hand_examples() {
+        let z = [0u8; 7];
+        // 両者無し → 0 → 少
+        assert_eq!(weighted_hand_total_from_counts(&z, &z), 0);
+        // 歩4 → 4 → 少
+        assert_eq!(weighted_hand_total_from_counts(&[4, 0, 0, 0, 0, 0, 0], &z), 4);
+        // 銀2 → 6 → 少
+        assert_eq!(weighted_hand_total_from_counts(&[0, 0, 0, 2, 0, 0, 0], &z), 6);
+        // 角1 + 歩4 → 6 + 4 = 10 → 多
+        assert_eq!(weighted_hand_total_from_counts(&[4, 0, 0, 0, 0, 1, 0], &z), 10);
+        // 飛1 + 銀1 → 7 + 3 = 10 → 多
+        assert_eq!(weighted_hand_total_from_counts(&[0, 0, 0, 1, 0, 0, 1], &z), 10);
+    }
+
+    /// 閾値境界(各進行度別): threshold-1 → 少, threshold → 多, threshold+1 → 多。
+    #[test]
+    fn test_p4h2_threshold_boundary() {
+        for &thr in &HAND_VALUE_THRESHOLDS {
+            let hb = |total: i32| -> u8 { if total >= thr { 1 } else { 0 } };
+            assert_eq!(hb(thr - 1), 0, "thr={thr}");
+            assert_eq!(hb(thr), 1, "thr={thr}");
+            assert_eq!(hb(thr + 1), 1, "thr={thr}");
+        }
+    }
+
+    /// 先後対称: 黒白の持駒を入れ替えても total(=hand_bucket)は不変。
+    #[test]
+    fn test_p4h2_hand_symmetry() {
+        let b = [1u8, 0, 2, 0, 1, 0, 1];
+        let w = [0u8, 3, 0, 1, 0, 1, 0];
+        assert_eq!(weighted_hand_total_from_counts(&b, &w), weighted_hand_total_from_counts(&w, &b));
+    }
+
+    /// stack = progress_bucket4*2 + hand_bucket2 は常に 0..=7。
+    #[test]
+    fn test_p4h2_stack_range() {
+        for pb8 in 0u8..8 {
+            for hand2 in 0i32..2 {
+                let stack = (pb8 / 2) as i32 * 2 + hand2;
+                assert!((0..8).contains(&stack), "stack out of range: {}", stack);
+            }
+        }
+    }
+
+    /// P8H2: stack = progress_bucket8*2 + hand_bucket2 は常に 0..=15、かつ
+    /// BUCKETS 定数(16)と全域が一致する。
+    #[test]
+    fn test_p8h2_stack_range() {
+        assert_eq!(SHOGI_PROGRESS8_HAND2_NUM_BUCKETS, 16);
+        let mut seen = [false; SHOGI_PROGRESS8_HAND2_NUM_BUCKETS];
+        for pb8 in 0i32..8 {
+            for hand2 in 0i32..2 {
+                let stack = pb8 * 2 + hand2;
+                assert!((0..16).contains(&stack), "stack out of range: {}", stack);
+                seen[stack as usize] = true;
+            }
+        }
+        assert!(seen.iter().all(|&s| s), "P8H2 は 0..=15 の全 bucket を張るべき");
+    }
+
     #[test]
     fn test_shogi_progress_bucket8_range() {
         let bucket = ShogiProgressBucket8::default();
@@ -691,5 +1096,60 @@ mod tests {
             let b = bucket.bucket(&psv_with_ply(ply));
             assert!(b <= 7, "progress8-kpabs-in-9 bucket must be in 0..=7, got {}", b);
         }
+    }
+
+    // ===== OPNARCH k9k9z (2026-11-14)。 値は設計書 2.2 の式を手で計算した固定値 =====
+    //   (python の runs/opnarch/kb_density.py の norm / z9 でも同じ値になる)。
+    fn sq(file1: u8, rank1: u8) -> crate::shogi::Square {
+        // 引数は将棋の表記 (筋 1..9 / 段 1..9)。 YO の sq = (筋-1)*9 + (段-1)。
+        crate::shogi::Square::new(file1 - 1, rank1 - 1)
+    }
+
+    #[test]
+    fn test_opn_z9_table() {
+        // 先手から見た座標: 1〜3 段 → 0、 4〜6 段 → 1、 7 段 → 2、 8 段 → 3/4/5、 9 段 → 6/7/8 (1〜3 筋 / 4〜6 筋 / 7〜9 筋)。
+        assert_eq!(opn_z9(sq(5, 1)), 0);
+        assert_eq!(opn_z9(sq(9, 3)), 0);
+        assert_eq!(opn_z9(sq(1, 4)), 1);
+        assert_eq!(opn_z9(sq(5, 6)), 1);
+        assert_eq!(opn_z9(sq(7, 7)), 2);
+        assert_eq!(opn_z9(sq(2, 8)), 3);
+        assert_eq!(opn_z9(sq(5, 8)), 4);
+        assert_eq!(opn_z9(sq(8, 8)), 5);
+        assert_eq!(opn_z9(sq(1, 9)), 6);
+        assert_eq!(opn_z9(sq(5, 9)), 7);
+        assert_eq!(opn_z9(sq(9, 9)), 8);
+    }
+
+    #[test]
+    fn test_opn_kz_fixed_positions() {
+        // (1) 平手の初期配置: 先手玉 5 九、 後手玉 5 一 → どちらも z9 = 7 → 7*9+7 = 70 (手番によらない)。
+        assert_eq!(opn_kz(Color::Black, sq(5, 9), sq(5, 1)), 70);
+        assert_eq!(opn_kz(Color::White, sq(5, 9), sq(5, 1)), 70);
+        // (2) 先手玉 2 八 (z9 3)、 後手玉 8 二 (後手から見て 2 八 = z9 3) → 30。
+        assert_eq!(opn_kz(Color::Black, sq(2, 8), sq(8, 2)), 30);
+        // (3) 先手玉 7 八 (z9 5)、 後手玉 3 二 (後手から見て 7 八 = z9 5) → 50。
+        assert_eq!(opn_kz(Color::Black, sq(7, 8), sq(3, 2)), 50);
+        // (4) 後手番: 先手玉 7 九 (z9 8)、 後手玉 4 三 (後手から見て 6 七 = z9 2)。
+        //     手番側 (後手) が上位桁 → 2*9+8 = 26。 先手番なら 8*9+2 = 74。
+        assert_eq!(opn_kz(Color::White, sq(7, 9), sq(4, 3)), 26);
+        assert_eq!(opn_kz(Color::Black, sq(7, 9), sq(4, 3)), 74);
+        // (5) 相手玉が自陣深く (入玉): 先手玉 1 一 (z9 0)、 後手玉 9 九 (後手から見て 1 一 = z9 0) → 0。
+        assert_eq!(opn_kz(Color::Black, sq(1, 1), sq(9, 9)), 0);
+        // 無効な升は 0 (panic しない)。
+        assert_eq!(opn_kz(Color::Black, crate::shogi::Square::NONE, sq(5, 1)), 0);
+    }
+
+    #[test]
+    fn test_opn_head_order_king_then_progress() {
+        // YO と同じ「玉 → 進行度」の順: head = kz*3 + pb。
+        assert_eq!(<ShogiOpnK9z<3> as OutputBuckets<PackedSfenValue>>::BUCKETS, 243);
+        assert_eq!(<ShogiOpnK9z<1> as OutputBuckets<PackedSfenValue>>::BUCKETS, 81);
+        assert_eq!(ShogiOpnK9z::<3>::head(70, 0), 210);
+        assert_eq!(ShogiOpnK9z::<3>::head(70, 2), 212);
+        assert_eq!(ShogiOpnK9z::<3>::head(80, 2), 242);
+        // 範囲外の進行度は pb = 2 に寄せる。
+        assert_eq!(ShogiOpnK9z::<3>::head(80, 7), 242);
+        assert_eq!(ShogiOpnK9z::<1>::head(26, 5), 26);
     }
 }

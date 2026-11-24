@@ -37,6 +37,7 @@ impl<B: BackendMarker> GraphIROperationBase<B> for Unary {
             UnaryOp::Add(x) => format!("+ {x}"),
             UnaryOp::Mul(x) => format!("* {x}"),
             UnaryOp::DiffableFromOutput(act) => format!("{act:?}"),
+            UnaryOp::Silu => "SiLU".to_string(),
         }
     }
 }
@@ -69,6 +70,71 @@ impl<B: BackendMarker> GraphIROperationCompilable<B> for Unary {
             });
         }
 
+        func
+    }
+}
+
+// ============================================================================
+// Phase 2 graph IR 統合 G2: UnaryF16Mixed (mixed precision unary op)
+// ============================================================================
+//
+// 既存 `Unary` (f32 全 path) と並ぶ新規 IR op。 input/output は f32 Tensor だが、
+// 内部で MixedUnary / MixedUnaryBackward (中間 f16 buffer + cast 経由) を push する。
+// 既存 `Unary` 無改造。 当面は `UnaryOp::Silu` のみ対応。
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct UnaryF16Mixed {
+    pub input: AnnotatedNode,
+    pub op: UnaryOp,
+}
+
+impl<B: BackendMarker> GraphIROperationBase<B> for UnaryF16Mixed {
+    fn nodes(&self) -> Vec<AnnotatedNode> {
+        vec![self.input]
+    }
+
+    fn output_shape(&self, ir: &GraphIR<B>) -> Result<Shape, GraphIRError> {
+        util::check_dense_eq(ir, &self.input, true)?;
+        Ok(self.input.shape)
+    }
+
+    fn shorthand(&self) -> String {
+        format!(
+            "{}(mixed-f16)",
+            match self.op {
+                UnaryOp::Silu => "SiLU".to_string(),
+                UnaryOp::DiffableFromOutput(act) => format!("{act:?}"),
+                UnaryOp::AbsPow(p) => format!("|x|^{p}"),
+                UnaryOp::Add(x) => format!("+ {x}"),
+                UnaryOp::Mul(x) => format!("* {x}"),
+            }
+        )
+    }
+}
+
+impl<B: BackendMarker> GraphIROperationCompilable<B> for UnaryF16Mixed {
+    fn forward_pass(&self, graph: &Graph<B::Backend>, output_node: NodeId) -> DeviceFunction<B::Backend> {
+        let input = graph.get_ref(self.input.idx, GraphNodeIdTy::Values);
+        let output = graph.get_ref(output_node, GraphNodeIdTy::Values);
+
+        let mut func = DeviceFunction::default();
+        func.push(function::MaybeUpdateBatchSize { input: input.clone(), output: output.clone() });
+        func.push(function::MixedUnary::new(input, output, self.op));
+        func
+    }
+
+    fn backward_pass(&self, graph: &Graph<B::Backend>, output_node: NodeId) -> DeviceFunction<B::Backend> {
+        let mut func = DeviceFunction::default();
+        if let Some(grd) = graph.maybe_get_ref(self.input.idx, GraphNodeIdTy::Gradients) {
+            let input = graph.get_ref(self.input.idx, GraphNodeIdTy::Values);
+            func.push(function::MaybeUpdateBatchSize { input: input.clone(), output: grd.clone() });
+            func.push(function::MixedUnaryBackward::new(
+                input,
+                grd,
+                graph.get_ref(output_node, GraphNodeIdTy::Gradients),
+                self.op,
+            ));
+        }
         func
     }
 }
@@ -135,6 +201,108 @@ impl<B: BackendMarker> GraphIROperationCompilable<B> for ReduceAcrossBatch {
                 reduction: self.reduction,
                 input_mul: 1.0,
                 output_mul: 1.0,
+            });
+        }
+
+        func
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Softmax {
+    pub input: AnnotatedNode,
+}
+
+impl<B: BackendMarker> GraphIROperationBase<B> for Softmax {
+    fn nodes(&self) -> Vec<AnnotatedNode> {
+        vec![self.input]
+    }
+
+    fn output_shape(&self, ir: &GraphIR<B>) -> Result<Shape, GraphIRError> {
+        util::check_dense_eq(ir, &self.input, true)?;
+        Ok(self.input.shape)
+    }
+
+    fn shorthand(&self) -> String {
+        "Softmax".to_string()
+    }
+}
+
+impl<B: BackendMarker> GraphIROperationCompilable<B> for Softmax {
+    fn forward_pass(&self, graph: &Graph<B::Backend>, output_node: NodeId) -> DeviceFunction<B::Backend> {
+        let input = graph.get_ref(self.input.idx, GraphNodeIdTy::Values);
+        let output = graph.get_ref(output_node, GraphNodeIdTy::Values);
+        let feature_size = self.input.shape.size();
+
+        let mut func = DeviceFunction::default();
+        func.push(function::MaybeUpdateBatchSize { input: input.clone(), output: output.clone() });
+        func.push(function::SoftmaxOp { input, output, feature_size });
+        func
+    }
+
+    fn backward_pass(&self, graph: &Graph<B::Backend>, output_node: NodeId) -> DeviceFunction<B::Backend> {
+        let mut func = DeviceFunction::default();
+
+        if let Some(grd) = graph.maybe_get_ref(self.input.idx, GraphNodeIdTy::Gradients) {
+            let softmax_out = graph.get_ref(output_node, GraphNodeIdTy::Values);
+            let output_grad = graph.get_ref(output_node, GraphNodeIdTy::Gradients);
+            let feature_size = self.input.shape.size();
+
+            func.push(function::MaybeUpdateBatchSize { input: softmax_out.clone(), output: grd.clone() });
+            func.push(function::SoftmaxBackward { softmax_out, output_grad, input_grad: grd, feature_size });
+        }
+
+        func
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RmsNorm {
+    pub input: AnnotatedNode,
+    pub eps: f32,
+}
+
+impl<B: BackendMarker> GraphIROperationBase<B> for RmsNorm {
+    fn nodes(&self) -> Vec<AnnotatedNode> {
+        vec![self.input]
+    }
+
+    fn output_shape(&self, ir: &GraphIR<B>) -> Result<Shape, GraphIRError> {
+        util::check_dense_eq(ir, &self.input, true)?;
+        Ok(self.input.shape)
+    }
+
+    fn shorthand(&self) -> String {
+        format!("RmsNorm(eps={})", self.eps)
+    }
+}
+
+impl<B: BackendMarker> GraphIROperationCompilable<B> for RmsNorm {
+    fn forward_pass(&self, graph: &Graph<B::Backend>, output_node: NodeId) -> DeviceFunction<B::Backend> {
+        let input = graph.get_ref(self.input.idx, GraphNodeIdTy::Values);
+        let output = graph.get_ref(output_node, GraphNodeIdTy::Values);
+        let feature_size = self.input.shape.size();
+
+        let mut func = DeviceFunction::default();
+        func.push(function::MaybeUpdateBatchSize { input: input.clone(), output: output.clone() });
+        func.push(function::RmsNorm { input, output, feature_size, eps: self.eps });
+        func
+    }
+
+    fn backward_pass(&self, graph: &Graph<B::Backend>, output_node: NodeId) -> DeviceFunction<B::Backend> {
+        let mut func = DeviceFunction::default();
+
+        if let Some(grd) = graph.maybe_get_ref(self.input.idx, GraphNodeIdTy::Gradients) {
+            let input = graph.get_ref(self.input.idx, GraphNodeIdTy::Values);
+            let feature_size = self.input.shape.size();
+
+            func.push(function::MaybeUpdateBatchSize { input: input.clone(), output: grd.clone() });
+            func.push(function::RmsNormBackward {
+                input,
+                input_grad: grd,
+                output_grad: graph.get_ref(output_node, GraphNodeIdTy::Gradients),
+                feature_size,
+                eps: self.eps,
             });
         }
 

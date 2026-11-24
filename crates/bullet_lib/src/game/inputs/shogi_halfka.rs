@@ -12,7 +12,7 @@
 //! - 入力次元: 138,510 (81 × 1710)
 //! - 最大アクティブ特徴: 40
 
-use super::SparseInputType;
+use super::{Factorises, SparseInputType};
 use crate::shogi::{
     BonaPiece, PackedSfenValue, ShogiBoard,
     bona_piece::{E_KING, F_KING, FE_HAND_END},
@@ -35,8 +35,14 @@ pub const PIECE_INPUTS: usize = 1629;
 /// HalfKA_hm の総入力次元
 pub const HALFKA_HM_DIMENSIONS: usize = NUM_KING_BUCKETS * PIECE_INPUTS; // 73,305
 
-/// 最大アクティブ特徴数 (盤上駒 + 手駒 = 40)
-pub const MAX_ACTIVE_FEATURES: usize = 40;
+/// 最大アクティブ特徴数
+///
+/// 実 PSV record (aoba_psv 等) で 75% が 40 超え、 max=54 まで観測 (2026-05-20 debug_psv_max_active で実証)。
+/// 駒 40 個固定だが、 持ち駒は `BonaPiece::from_hand_piece(_, _, _, i)` で
+/// 1..=count を別 index に展開するため、 同型駒 N 枚で N 個 sparse index 出す。
+/// 駒 40 - 持ち駒 14 (例) + 持ち駒 N 個 (1..N 展開) = 最大 54 程度。
+/// 余裕を見て 64 に設定 (loader buffer 増分は batch_size × 24 × 4 byte = batch×96 byte 程度の影響)。
+pub const MAX_ACTIVE_FEATURES: usize = 64;
 
 // =============================================================================
 // ShogiHalfKA_hm 特徴量型
@@ -84,6 +90,196 @@ impl SparseInputType for ShogiHalfKA_hm {
     /// 説明
     fn description(&self) -> String {
         "Shogi HalfKA_hm: 45 king buckets (half-mirrored), 1629 piece inputs".to_string()
+    }
+}
+
+// =============================================================================
+// ShogiHalfKA_hmK16 (OPN 幅 2048 用、 玉区分 45 -> 16。 2026-11-14 OPN2048 推奨案 K16)
+// =============================================================================
+
+/// K16 の玉区分数 (自玉 7〜9 段 × 鏡像後 5 筋 = 15 + 「その他 (1〜6 段)」 1)
+pub const NUM_KING_BUCKETS_K16: usize = 16;
+
+/// K16 の総入力次元: 16 × 1629 = 26,064 (factoriser 込みで 27,693)
+pub const HALFKA_HM_K16_DIMENSIONS: usize = NUM_KING_BUCKETS_K16 * PIECE_INPUTS; // 26,064
+
+/// HalfKA_hm の玉区分 kb (0..45、 `kb = f * 9 + r`) を K16 の区分 (0..16) に写す。
+///
+/// 設計書 DESIGN-20261114-OPN2048-FABLE.md 2.3:
+/// - r >= 6 (持ち主から見て 7〜9 段) → `f * 3 + (r - 6)` (0..14)
+/// - r < 6 (1〜6 段) → 15 (束ねる)
+///
+/// 鏡像・駒の添字は変えない (変わるのは玉区分の番号だけ)。
+#[inline]
+pub const fn king_bucket16(kb: usize) -> usize {
+    let f = kb / 9;
+    let r = kb % 9;
+    if r >= 6 { f * 3 + (r - 6) } else { 15 }
+}
+
+/// HalfKA_hm の添字 (`kb * 1629 + packed`) を K16 の添字 (`kb16 * 1629 + packed`) に写す。
+#[inline]
+pub const fn halfka_k16_index_from_k45(idx: usize) -> usize {
+    king_bucket16(idx / PIECE_INPUTS) * PIECE_INPUTS + idx % PIECE_INPUTS
+}
+
+/// ShogiHalfKA_hm の玉区分を 16 に絞った特徴量 (OPN の幅 2048 を GPU 4GB に載せるため)。
+///
+/// 添字 = `king_bucket16(kb) * 1629 + pack_bonapiece(bp, 鏡像)`。
+/// ShogiHalfKA_hm の各添字に `halfka_k16_index_from_k45` を掛けたものと同一 (emit 順も同じ)。
+/// factoriser (`ShogiPieceFactor`) は今と同じ `feat % 1629`。
+#[allow(non_camel_case_types)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ShogiHalfKA_hmK16;
+
+impl SparseInputType for ShogiHalfKA_hmK16 {
+    type RequiredDataType = PackedSfenValue;
+
+    /// 16 × 1629 = 26,064
+    fn num_inputs(&self) -> usize {
+        HALFKA_HM_K16_DIMENSIONS
+    }
+
+    fn max_active(&self) -> usize {
+        MAX_ACTIVE_FEATURES
+    }
+
+    fn map_features<F: FnMut(usize, usize)>(&self, pos: &Self::RequiredDataType, mut f: F) {
+        let board = ShogiBoard::from_packed_sfen(pos);
+        map_halfka_features(&board, |stm, ntm| f(halfka_k16_index_from_k45(stm), halfka_k16_index_from_k45(ntm)));
+    }
+
+    fn shorthand(&self) -> String {
+        "shogi-26064x16hmk16".to_string()
+    }
+
+    fn description(&self) -> String {
+        "Shogi HalfKA_hm K16: 16 king buckets (own rank 7-9 x 5 files + other), 1629 piece inputs".to_string()
+    }
+}
+
+// =============================================================================
+// ShogiPieceFactor (HalfKA_hm 用 feature factorizer)
+// =============================================================================
+
+/// HalfKA_hm 用の piece-square factorizer (nnue-pytorch HalfKA "A" factor 相当)。
+///
+/// `ShogiHalfKA_hm` の実特徴 `index = king_bucket × 1629 + packed_bonapiece` から
+/// 玉位置 (king_bucket) を落とした `packed_bonapiece` (= `feat % 1629`) を virtual
+/// feature として付与する。 訓練時は 45 バケット分の実特徴が共有 factor を通じて
+/// 勾配を共有し、 疎な玉位置別特徴の学習を加速する。
+///
+/// **推論形状は不変**: `Factorised<ShogiHalfKA_hm, ShogiPieceFactor>` を export する際に
+/// factor 重みを実特徴へ coalesce するため、 engine (rshogi) 側は 73,305 次元の
+/// HalfKA_hm のまま変更不要。
+///
+/// factoriser 単独では `Factorised` の内部でしか利用されないが、 `SparseInputType`
+/// 契約を満たすため `map_features` は `feat % 1629` を emit する最小実装を持つ
+/// (= standalone でも valid な piece-square 特徴)。
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ShogiPieceFactor;
+
+impl SparseInputType for ShogiPieceFactor {
+    type RequiredDataType = PackedSfenValue;
+
+    /// 特徴量の総次元数: 1629 (玉位置非依存の packed BonaPiece)
+    fn num_inputs(&self) -> usize {
+        PIECE_INPUTS
+    }
+
+    fn max_active(&self) -> usize {
+        MAX_ACTIVE_FEATURES
+    }
+
+    /// factoriser 単独時は `feat % 1629` の piece-square 特徴を emit する。
+    /// (通常は `Factorised` 経由で `derive_feature` が呼ばれるため未使用。)
+    fn map_features<F: FnMut(usize, usize)>(&self, pos: &Self::RequiredDataType, mut f: F) {
+        let board = ShogiBoard::from_packed_sfen(pos);
+        map_halfka_features(&board, |stm, ntm| f(stm % PIECE_INPUTS, ntm % PIECE_INPUTS));
+    }
+
+    fn shorthand(&self) -> String {
+        "shogi-1629factor".to_string()
+    }
+
+    fn description(&self) -> String {
+        "Shogi HalfKA_hm piece-square factor (king-independent packed BonaPiece, 1629)".to_string()
+    }
+}
+
+impl Factorises<ShogiHalfKA_hm> for ShogiPieceFactor {
+    /// 実特徴 `feat = king_bucket × 1629 + packed_bp` から玉位置を落とし
+    /// `packed_bp = feat % 1629` を virtual factor feature として derive する。
+    fn derive_feature(&self, _input: &ShogiHalfKA_hm, feat: usize) -> Option<usize> {
+        Some(feat % PIECE_INPUTS)
+    }
+}
+
+// 2026-11-14 OPN2048 K16: 玉区分を絞っても packed BonaPiece (= feat % 1629) は同じなので、
+// factoriser の行と式は HalfKA_hm と共通 (表は 1,629 行のまま)。
+impl Factorises<ShogiHalfKA_hmK16> for ShogiPieceFactor {
+    fn derive_feature(&self, _input: &ShogiHalfKA_hmK16, feat: usize) -> Option<usize> {
+        Some(feat % PIECE_INPUTS)
+    }
+}
+
+// HalfKA_hm を main sparse 入力として継承する wrapper 型 (aux dense / aux sparse
+// を追加するだけで main 特徴は 73,305 次元のまま) にも同じ derive を提供する。
+// これにより --factorise を Dual PSQT / PairShape / KingDanger 等の head 構成と
+// 併用できる (nnue-pytorch の feature factorizer 相当を全構成で利用可能にする)。
+
+impl Factorises<super::shogi_halfka_hm_hand_count::ShogiHalfKaHmHandCount> for ShogiPieceFactor {
+    fn derive_feature(
+        &self,
+        _input: &super::shogi_halfka_hm_hand_count::ShogiHalfKaHmHandCount,
+        feat: usize,
+    ) -> Option<usize> {
+        Some(feat % PIECE_INPUTS)
+    }
+}
+
+impl Factorises<super::shogi_halfka_hm_pin_only::ShogiHalfKaHmPin> for ShogiPieceFactor {
+    fn derive_feature(&self, _input: &super::shogi_halfka_hm_pin_only::ShogiHalfKaHmPin, feat: usize) -> Option<usize> {
+        Some(feat % PIECE_INPUTS)
+    }
+}
+
+// AUXCHEAP 連結入力 (HalfKA 73,305 + aux 392 = 73,697) では **HalfKA 部のみ**
+// factorise する。 aux 特徴 (feat >= 73,305) は king 非依存の生特徴なので
+// factor の意味が無く (そもそも l0w aux 行は凍結ゼロ、 psqtw aux 行は 392 行しか
+// なく共有すべき king bucket が無い)、 `None` を返して factor 対象外とする。
+impl Factorises<super::shogi_halfka_hm_auxcheap::ShogiHalfKaHmAuxCheap> for ShogiPieceFactor {
+    fn derive_feature(
+        &self,
+        _input: &super::shogi_halfka_hm_auxcheap::ShogiHalfKaHmAuxCheap,
+        feat: usize,
+    ) -> Option<usize> {
+        (feat < HALFKA_HM_DIMENSIONS).then_some(feat % PIECE_INPUTS)
+    }
+}
+
+// 2026-09-29: threat と併用できるようにする。
+// `ShogiHalfKaHmThreat::num_inputs() = HALFKA_HM_DIMENSIONS + threat_dims` であり、
+// **HalfKA 部は先頭 73,305 に固定**、 threat は末尾に足されるだけなので
+// auxcheap とまったく同じ構造。 threat 特徴 (feat >= 73,305) は king 非依存なので
+// `None` を返して factor 対象外にする。
+impl Factorises<super::shogi_halfka_hm_threat::ShogiHalfKaHmThreat> for ShogiPieceFactor {
+    fn derive_feature(
+        &self,
+        _input: &super::shogi_halfka_hm_threat::ShogiHalfKaHmThreat,
+        feat: usize,
+    ) -> Option<usize> {
+        (feat < HALFKA_HM_DIMENSIONS).then_some(feat % PIECE_INPUTS)
+    }
+}
+
+impl Factorises<super::shogi_halfka_hm_king_attacker_dual::ShogiHalfKaHmKingAttackerDual> for ShogiPieceFactor {
+    fn derive_feature(
+        &self,
+        _input: &super::shogi_halfka_hm_king_attacker_dual::ShogiHalfKaHmKingAttackerDual,
+        feat: usize,
+    ) -> Option<usize> {
+        Some(feat % PIECE_INPUTS)
     }
 }
 
@@ -480,13 +676,82 @@ mod tests {
     fn test_dimensions() {
         let input = ShogiHalfKA_hm;
         assert_eq!(input.num_inputs(), 73_305);
-        assert_eq!(input.max_active(), 40);
+        assert_eq!(input.max_active(), 64);
     }
 
     #[test]
     fn test_shorthand() {
         let input = ShogiHalfKA_hm;
         assert_eq!(input.shorthand(), "shogi-73305x45hm");
+    }
+
+    // =============================================================================
+    // Factorizer (ShogiPieceFactor) テスト
+    // =============================================================================
+
+    #[test]
+    fn test_piece_factor_basic() {
+        use super::super::{Factorised, Factorises};
+        let fac = ShogiPieceFactor;
+        assert_eq!(fac.num_inputs(), 1629);
+        // derive_feature = feat % 1629 (玉位置を落とす)
+        assert_eq!(fac.derive_feature(&ShogiHalfKA_hm, 0), Some(0));
+        assert_eq!(fac.derive_feature(&ShogiHalfKA_hm, 1628), Some(1628));
+        assert_eq!(fac.derive_feature(&ShogiHalfKA_hm, 1629), Some(0)); // bucket 1, packed 0
+        assert_eq!(fac.derive_feature(&ShogiHalfKA_hm, 44 * 1629 + 5), Some(5)); // bucket 44
+        // Factorised 型の次元
+        let f: Factorised<ShogiHalfKA_hm, ShogiPieceFactor> = Factorised::from_parts(ShogiHalfKA_hm, ShogiPieceFactor);
+        assert_eq!(f.num_inputs(), 73_305 + 1_629); // 74,934
+        assert!(f.is_factorised());
+    }
+
+    /// export 側の coalesce 式が bullet 標準の `merge_factoriser` (信頼済み参照実装) と
+    /// bit-exact 一致することを検証する golden test。
+    ///
+    /// export (`shogi_layerstack.rs`) の FT/PSQT coalesce ループ:
+    ///   `coalesced[r*L + o] = l0w[(1629 + r)*L + o] + l0w[(r % 1629)*L + o]`
+    /// (L = layer_size = ft_out(FT) または NUM_BUCKETS(PSQT))
+    /// が、`Factorised::merge_factoriser` と同一結果を返すことを確認する。
+    /// column-major / offset(=PIECE_INPUTS) / 剰余(=% PIECE_INPUTS) の取り違え
+    /// (= silent bug) を検出する。
+    #[test]
+    fn test_factoriser_coalesce_matches_merge() {
+        use super::super::{Factorised, SparseInputType};
+        let f: Factorised<ShogiHalfKA_hm, ShogiPieceFactor> = Factorised::from_parts(ShogiHalfKA_hm, ShogiPieceFactor);
+
+        let normal_inputs = 73_305usize;
+        let total_inputs = f.num_inputs(); // 74,934
+        let piece = PIECE_INPUTS; // 1629 = offset & modulus
+
+        // 疑似乱数で unmerged (= graph l0w/psqtw) を生成。 layout = [total_inputs, layer_size]
+        // feature-major (unmerged[feat*L + idx]) = graph tensor の column-major と一致。
+        // layer_size = ft_out 相当 (8) と PSQT NUM_BUCKETS 相当 (9) の 2 パターン。
+        for layer_size in [8usize, 9usize] {
+            let mut unmerged = vec![0.0f32; total_inputs * layer_size];
+            let mut state = 0x1234_5678u32;
+            for v in unmerged.iter_mut() {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                *v = (state >> 8) as f32 / 8_388_608.0 - 1.0; // ~[-1, 1)
+            }
+
+            // (A) bullet 標準 merge_factoriser (参照)
+            let reference = f.merge_factoriser(unmerged.clone());
+
+            // (B) export と同一の coalesce ループ (手本実装)
+            let mut mine = vec![0.0f32; normal_inputs * layer_size];
+            for r in 0..normal_inputs {
+                let real_base = (piece + r) * layer_size;
+                let factor_base = (r % piece) * layer_size;
+                for o in 0..layer_size {
+                    mine[r * layer_size + o] = unmerged[real_base + o] + unmerged[factor_base + o];
+                }
+            }
+
+            assert_eq!(reference.len(), mine.len());
+            for (i, (&a, &b)) in reference.iter().zip(mine.iter()).enumerate() {
+                assert!((a - b).abs() < 1e-6, "coalesce mismatch @ {i} (L={layer_size}): ref={a} mine={b}");
+            }
+        }
     }
 
     #[test]
@@ -576,6 +841,35 @@ mod tests {
         assert_eq!(halfka_index(44, 0), 44 * PIECE_INPUTS);
     }
 
+    // ---- K16 (2026-11-14 OPN2048) ----
+
+    #[test]
+    fn test_k16_dimensions_and_table() {
+        use super::super::Factorised;
+        assert_eq!(ShogiHalfKA_hmK16.num_inputs(), 26_064);
+        let f: Factorised<ShogiHalfKA_hmK16, ShogiPieceFactor> =
+            Factorised::from_parts(ShogiHalfKA_hmK16, ShogiPieceFactor);
+        assert_eq!(f.num_inputs(), 27_693); // 設計書 2.3 / 起動ログで照合する値
+        // 45 区分すべての写像 (設計書 2.3 の式を表で固定)
+        let mut hist = [0usize; 16];
+        for kb in 0..45 {
+            let (fl, r) = (kb / 9, kb % 9);
+            let want = if r >= 6 { fl * 3 + (r - 6) } else { 15 };
+            assert_eq!(king_bucket16(kb), want, "kb={kb}");
+            hist[king_bucket16(kb)] += 1;
+        }
+        // 7〜9 段の 15 区分は 1 対 1、 その他は 30 区分を束ねる
+        assert!(hist[..15].iter().all(|&c| c == 1));
+        assert_eq!(hist[15], 30);
+        // 代表点: 5九 (kb 44) -> 4*3+2 = 14 / 1七 (kb 6) -> 0 / 5一 (kb 36) -> 15
+        assert_eq!(king_bucket16(44), 14);
+        assert_eq!(king_bucket16(6), 0);
+        assert_eq!(king_bucket16(36), 15);
+        // 添字の写像: packed は保たれる
+        assert_eq!(halfka_k16_index_from_k45(44 * PIECE_INPUTS + 1628), 14 * PIECE_INPUTS + 1628);
+        assert_eq!(halfka_k16_index_from_k45(36 * PIECE_INPUTS + 5), 15 * PIECE_INPUTS + 5);
+    }
+
     #[test]
     fn test_king_bonapiece() {
         // 自玉 (sq_index=0)
@@ -638,7 +932,7 @@ mod tests {
     fn test_halfka_nonmirror_dimensions() {
         let input = ShogiHalfKA;
         assert_eq!(input.num_inputs(), 138_510);
-        assert_eq!(input.max_active(), 40);
+        assert_eq!(input.max_active(), 64);
     }
 
     #[test]

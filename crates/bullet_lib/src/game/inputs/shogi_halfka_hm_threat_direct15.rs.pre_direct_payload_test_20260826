@@ -1,0 +1,369 @@
+//! Profile 15: HalfKA_hm + 10-class one-sided ThreatDirect sparse input.
+//!
+//! The Direct evaluator computes, per perspective, enemy-attacker -> friendly-target
+//! relations and subtracts the two perspective sums.  This input therefore overrides
+//! `map_features_split` so the two active sets may have different lengths.
+
+use super::SparseInputType;
+use super::shogi_halfka::{HALFKA_HM_DIMENSIONS, MAX_ACTIVE_FEATURES, ShogiHalfKA_hm, is_hm_mirror};
+use super::shogi_halfka_hm_threat::{Occupied, for_each_attack, normalize_sq};
+use crate::shogi::{
+    PackedSfenValue, ShogiBoard,
+    types::{Color, PieceType, Square},
+};
+
+/// P2THRD2 / Profile 15 direct dimensions: 10 target classes times the sum of
+/// all 10 attacker-class empty-board attack counts.
+pub const THREAT_DIRECT15_DIMENSIONS: usize = 65_640;
+pub const THREAT_DIRECT15_CLASS_NB: usize = 10;
+pub const THREAT_DIRECT15_KING_CLASS: usize = 9;
+const MAX_ACTIVE_DIRECT15_FEATURES: usize = 360;
+
+const ATTACKS_PER_CLASS: [usize; THREAT_DIRECT15_CLASS_NB] = [72, 324, 112, 328, 416, 816, 1296, 1104, 1552, 544];
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ShogiHalfKaHmThreatDirect15;
+
+#[inline]
+fn class_from_piece_type(pt: PieceType) -> Option<usize> {
+    match pt {
+        PieceType::Pawn => Some(0),
+        PieceType::Lance => Some(1),
+        PieceType::Knight => Some(2),
+        PieceType::Silver => Some(3),
+        PieceType::Gold | PieceType::ProPawn | PieceType::ProLance | PieceType::ProKnight | PieceType::ProSilver => {
+            Some(4)
+        }
+        PieceType::Bishop => Some(5),
+        PieceType::Rook => Some(6),
+        PieceType::Horse => Some(7),
+        PieceType::Dragon => Some(8),
+        PieceType::King => Some(THREAT_DIRECT15_KING_CLASS),
+        PieceType::None => None,
+    }
+}
+
+/// The C++ Profile 15 table groups rows by attacker class and then target class.
+#[inline]
+fn pair_base(attacker_class: usize, target_class: usize) -> usize {
+    debug_assert!(attacker_class < THREAT_DIRECT15_CLASS_NB);
+    debug_assert!(target_class < THREAT_DIRECT15_CLASS_NB);
+    let mut base = 0usize;
+    for class in 0..attacker_class {
+        base += THREAT_DIRECT15_CLASS_NB * ATTACKS_PER_CLASS[class];
+    }
+    base + target_class * ATTACKS_PER_CLASS[attacker_class]
+}
+
+/// Number of legal empty-board moves from all lower square IDs for one normalized
+/// white-oriented attacker.  C++ sorts target square IDs before assigning the row.
+#[inline]
+fn row_offset(attacker_class: usize, from: Square, to: Square) -> usize {
+    let from_raw = from.0 as usize;
+    let to_raw = to.0;
+    let mut offset = 0usize;
+    for raw in 0..from_raw {
+        let sq = Square(raw as u8);
+        let count = attack_targets(attacker_class, sq, None, None, &mut []);
+        offset += count;
+    }
+    let mut targets = [Square(0); 36];
+    let count = attack_targets(attacker_class, from, Some(Color::White), None, &mut targets);
+    for (ordinal, target) in targets[..count].iter().enumerate() {
+        if target.0 == to_raw {
+            return offset + ordinal;
+        }
+    }
+    panic!("Profile15 Direct target is not in the normalized attack set");
+}
+
+/// Enumerate empty-board legal target squares in the same raw-square ascending order
+/// as the C++ Direct15 table.  This does not inspect occupation; real attacks are
+/// obtained separately through `for_each_attack`.
+fn attack_targets(
+    attacker_class: usize,
+    from: Square,
+    oriented: Option<Color>,
+    _unused: Option<()>,
+    out: &mut [Square],
+) -> usize {
+    let color = oriented.unwrap_or(Color::White);
+    let file = (from.0 / 9) as i8;
+    let rank = (from.0 % 9) as i8;
+    let mut count = 0usize;
+    let mut push = |f: i8, r: i8| {
+        if (0..9).contains(&f) && (0..9).contains(&r) {
+            if count < out.len() {
+                out[count] = Square((f as u8) * 9 + r as u8);
+            }
+            count += 1;
+        }
+    };
+    let fwd = if color == Color::Black { -1 } else { 1 };
+    match attacker_class {
+        0 => push(file, rank + fwd),
+        1 => {
+            let mut r = rank + fwd;
+            while (0..9).contains(&r) {
+                push(file, r);
+                r += fwd;
+            }
+        }
+        2 => {
+            push(file - 1, rank + 2 * fwd);
+            push(file + 1, rank + 2 * fwd);
+        }
+        3 => {
+            for (df, dr) in [(-1, fwd), (0, fwd), (1, fwd), (-1, -fwd), (1, -fwd)] {
+                push(file + df, rank + dr);
+            }
+        }
+        4 => {
+            for (df, dr) in [(-1, fwd), (0, fwd), (1, fwd), (-1, 0), (1, 0), (0, -fwd)] {
+                push(file + df, rank + dr);
+            }
+        }
+        5 | 7 => {
+            for (df, dr) in [(-1, -1), (-1, 1), (1, -1), (1, 1)] {
+                let mut f = file + df;
+                let mut r = rank + dr;
+                while (0..9).contains(&f) && (0..9).contains(&r) {
+                    push(f, r);
+                    f += df;
+                    r += dr;
+                }
+            }
+            if attacker_class == 7 {
+                for (df, dr) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
+                    push(file + df, rank + dr);
+                }
+            }
+        }
+        6 | 8 => {
+            for (df, dr) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
+                let mut f = file + df;
+                let mut r = rank + dr;
+                while (0..9).contains(&f) && (0..9).contains(&r) {
+                    push(f, r);
+                    f += df;
+                    r += dr;
+                }
+            }
+            if attacker_class == 8 {
+                for (df, dr) in [(-1, -1), (-1, 1), (1, -1), (1, 1)] {
+                    push(file + df, rank + dr);
+                }
+            }
+        }
+        THREAT_DIRECT15_KING_CLASS => {
+            for df in -1..=1 {
+                for dr in -1..=1 {
+                    if df != 0 || dr != 0 {
+                        push(file + df, rank + dr);
+                    }
+                }
+            }
+        }
+        _ => unreachable!(),
+    }
+    // C++ uses insertion sort by raw square ID.
+    let stored = count.min(out.len());
+    for i in 1..stored {
+        let key = out[i];
+        let mut j = i;
+        while j > 0 && out[j - 1].0 > key.0 {
+            out[j] = out[j - 1];
+            j -= 1;
+        }
+        out[j] = key;
+    }
+    count
+}
+
+impl ShogiHalfKaHmThreatDirect15 {
+    pub const fn new() -> Self {
+        Self
+    }
+
+    fn map_split<F: FnMut(Option<usize>, Option<usize>)>(&self, pos: &PackedSfenValue, mut f: F) {
+        // Reuse the exact HalfKA_hm implementation for the symmetric prefix.
+        ShogiHalfKA_hm.map_features(pos, |stm, nstm| f(Some(stm), Some(nstm)));
+
+        let board = ShogiBoard::from_packed_sfen(pos);
+        let stm = board.side_to_move;
+        let nstm = stm.opponent();
+        let stm_king = board.king_square(stm);
+        let nstm_king = board.king_square(nstm);
+        if !stm_king.is_valid() || !nstm_king.is_valid() {
+            return;
+        }
+        let stm_hm = is_hm_mirror(stm_king, stm);
+        let nstm_hm = is_hm_mirror(nstm_king, nstm);
+        let occ = Occupied::from_board(&board);
+
+        for raw in 0..81u8 {
+            let from = Square(raw);
+            let attacker = board.piece_on(from);
+            if attacker.is_none() {
+                continue;
+            }
+            let Some(ac) = class_from_piece_type(attacker.piece_type) else {
+                continue;
+            };
+            let attacker_color = attacker.color;
+            for_each_attack(attacker.piece_type, attacker_color, from, &occ, |to| {
+                let target = board.piece_on(to);
+                if target.is_none() {
+                    return;
+                }
+                let Some(dc) = class_from_piece_type(target.piece_type) else {
+                    return;
+                };
+
+                if attacker_color != stm && target.color == stm {
+                    let from_n = normalize_sq(from, stm, stm_hm);
+                    let to_n = normalize_sq(to, stm, stm_hm);
+                    let idx = HALFKA_HM_DIMENSIONS + pair_base(ac, dc) + row_offset(ac, from_n, to_n);
+                    f(Some(idx), None);
+                }
+                if attacker_color != nstm && target.color == nstm {
+                    let from_n = normalize_sq(from, nstm, nstm_hm);
+                    let to_n = normalize_sq(to, nstm, nstm_hm);
+                    let idx = HALFKA_HM_DIMENSIONS + pair_base(ac, dc) + row_offset(ac, from_n, to_n);
+                    f(None, Some(idx));
+                }
+            });
+        }
+    }
+}
+
+impl SparseInputType for ShogiHalfKaHmThreatDirect15 {
+    type RequiredDataType = PackedSfenValue;
+    fn num_inputs(&self) -> usize {
+        HALFKA_HM_DIMENSIONS + THREAT_DIRECT15_DIMENSIONS
+    }
+    fn max_active(&self) -> usize {
+        MAX_ACTIVE_FEATURES + MAX_ACTIVE_DIRECT15_FEATURES
+    }
+    fn map_features<F: FnMut(usize, usize)>(&self, pos: &Self::RequiredDataType, mut f: F) {
+        // DataLoader uses map_features_split.  This fallback keeps the symmetric
+        // HalfKA prefix available to legacy callers without inventing a Direct pair.
+        ShogiHalfKA_hm.map_features(pos, |stm, nstm| f(stm, nstm));
+    }
+    fn map_features_split<F: FnMut(Option<usize>, Option<usize>)>(&self, pos: &Self::RequiredDataType, f: F) {
+        self.map_split(pos, f);
+    }
+    fn shorthand(&self) -> String {
+        format!("shogi-{}x45hm+threatdirect15", self.num_inputs())
+    }
+    fn description(&self) -> String {
+        format!(
+            "Shogi HalfKA_hm ({}) + one-sided 10-class ThreatDirect Profile 15 ({})",
+            HALFKA_HM_DIMENSIONS, THREAT_DIRECT15_DIMENSIONS
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn profile15_dimension_matches_contract() {
+        assert_eq!(ATTACKS_PER_CLASS.iter().sum::<usize>() * THREAT_DIRECT15_CLASS_NB, THREAT_DIRECT15_DIMENSIONS);
+    }
+
+    /// C++ Direct15 LUTの仕様（attacker-major / target-minor、White向きの
+    /// directional pattern、raw-square昇順）とKing第10クラスを照合する。
+    #[test]
+    fn profile15_cpp_lut_contract_including_king() {
+        let mut expected_pair_base = 0usize;
+        for attacker_class in 0..THREAT_DIRECT15_CLASS_NB {
+            for target_class in 0..THREAT_DIRECT15_CLASS_NB {
+                assert_eq!(pair_base(attacker_class, target_class), expected_pair_base);
+                expected_pair_base += ATTACKS_PER_CLASS[attacker_class];
+            }
+        }
+        assert_eq!(expected_pair_base, THREAT_DIRECT15_DIMENSIONS);
+        assert_eq!(pair_base(THREAT_DIRECT15_KING_CLASS, THREAT_DIRECT15_KING_CLASS), 65_096);
+
+        for attacker_class in 0..THREAT_DIRECT15_CLASS_NB {
+            let mut expected_row = 0usize;
+            for raw_from in 0..81u8 {
+                let from = Square(raw_from);
+                let mut targets = [Square(0); 36];
+                let count = attack_targets(attacker_class, from, Some(Color::White), None, &mut targets);
+                for (ordinal, target) in targets[..count].iter().enumerate() {
+                    assert_eq!(
+                        row_offset(attacker_class, from, *target),
+                        expected_row + ordinal,
+                        "attacker_class={attacker_class}, from={raw_from}, to={}",
+                        target.0,
+                    );
+                }
+                expected_row += count;
+            }
+            assert_eq!(expected_row, ATTACKS_PER_CLASS[attacker_class]);
+        }
+        assert_eq!(
+            pair_base(THREAT_DIRECT15_KING_CLASS, THREAT_DIRECT15_KING_CLASS)
+                + ATTACKS_PER_CLASS[THREAT_DIRECT15_KING_CLASS]
+                - 1,
+            THREAT_DIRECT15_DIMENSIONS - 1
+        );
+    }
+
+    /// 実PSVからDirect15の片側活性数を測り、固定sparse容量360に収まることを確認する。
+    /// 呼出し時に `PROFILE15_PSV_SAMPLE`、任意で `PROFILE15_PSV_RECORDS` を設定する。
+    #[test]
+    fn profile15_real_psv_direct_activity_fits_capacity() {
+        use std::{env, fs::File, io::Read};
+
+        let path = env::var("PROFILE15_PSV_SAMPLE").expect("PROFILE15_PSV_SAMPLE must point to a 40-byte PSV file");
+        let requested =
+            env::var("PROFILE15_PSV_RECORDS").ok().and_then(|value| value.parse::<usize>().ok()).unwrap_or(100_000);
+        assert!(requested > 0, "PROFILE15_PSV_RECORDS must be positive");
+
+        let mut file = File::open(&path).expect("open PROFILE15_PSV_SAMPLE");
+        let input = ShogiHalfKaHmThreatDirect15::new();
+        let mut psv = PackedSfenValue::default();
+        let mut record = [0u8; 40];
+        let mut scanned = 0usize;
+        let mut max_stm_direct = 0usize;
+        let mut max_nstm_direct = 0usize;
+
+        while scanned < requested {
+            match file.read_exact(&mut record) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(error) => panic!("read PSV record {scanned}: {error}"),
+            }
+            psv.as_bytes_mut().copy_from_slice(&record);
+            let mut stm_direct = 0usize;
+            let mut nstm_direct = 0usize;
+            input.map_features_split(&psv, |stm, nstm| {
+                if matches!(stm, Some(index) if index >= HALFKA_HM_DIMENSIONS) {
+                    stm_direct += 1;
+                }
+                if matches!(nstm, Some(index) if index >= HALFKA_HM_DIMENSIONS) {
+                    nstm_direct += 1;
+                }
+            });
+            max_stm_direct = max_stm_direct.max(stm_direct);
+            max_nstm_direct = max_nstm_direct.max(nstm_direct);
+            assert!(
+                stm_direct <= MAX_ACTIVE_DIRECT15_FEATURES,
+                "STM Direct features exceeded sparse capacity at record {scanned}: {stm_direct}"
+            );
+            assert!(
+                nstm_direct <= MAX_ACTIVE_DIRECT15_FEATURES,
+                "NSTM Direct features exceeded sparse capacity at record {scanned}: {nstm_direct}"
+            );
+            scanned += 1;
+        }
+
+        assert!(scanned > 0, "PSV sample contains no complete records");
+        eprintln!(
+            "Profile15 Direct activity: scanned={scanned}, max_stm={max_stm_direct}, max_nstm={max_nstm_direct}, capacity={MAX_ACTIVE_DIRECT15_FEATURES}"
+        );
+    }
+}

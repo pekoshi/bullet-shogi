@@ -111,23 +111,23 @@ const HCP_HAND_TABLE: [HcpHandCode; 21] = [
 // =============================================================================
 
 /// LSB-first ビットストリーム (読み取り)
-struct BitReader<'a> {
+pub(super) struct BitReader<'a> {
     data: &'a [u8],
     cursor: usize,
 }
 
 impl<'a> BitReader<'a> {
-    fn new(data: &'a [u8]) -> Self {
+    pub(super) fn new(data: &'a [u8]) -> Self {
         Self { data, cursor: 0 }
     }
 
     #[inline]
-    fn cursor(&self) -> usize {
+    pub(super) fn cursor(&self) -> usize {
         self.cursor
     }
 
     #[inline]
-    fn read_bit(&mut self) -> u8 {
+    pub(super) fn read_bit(&mut self) -> u8 {
         let byte_idx = self.cursor / 8;
         if byte_idx >= self.data.len() {
             return 0;
@@ -138,7 +138,7 @@ impl<'a> BitReader<'a> {
     }
 
     #[inline]
-    fn read_bits(&mut self, n: usize) -> u32 {
+    pub(super) fn read_bits(&mut self, n: usize) -> u32 {
         let mut result = 0u32;
         for i in 0..n {
             result |= (self.read_bit() as u32) << i;
@@ -265,11 +265,13 @@ fn decode_hcp_hand_entry(stream: &mut BitReader) -> Option<(usize, Option<Color>
 ///
 /// HCP/平手から初期化し、cshogi move16 を適用しながら
 /// PSfen 形式にパックする機能を提供する。
-struct MiniPosition {
-    board: [Piece; 81],
-    hands: [Hand; 2],
-    side_to_move: Color,
-    game_ply: u16,
+///
+/// `loader` module 内 (= hcpe loader) からも再利用するため `pub(super)`。
+pub(super) struct MiniPosition {
+    pub(super) board: [Piece; 81],
+    pub(super) hands: [Hand; 2],
+    pub(super) side_to_move: Color,
+    pub(super) game_ply: u16,
 }
 
 impl MiniPosition {
@@ -324,7 +326,19 @@ impl MiniPosition {
     }
 
     /// HuffmanCodedPos (HCP) 32バイトからデコード
-    fn from_hcp(hcp: &[u8; 32], game_ply: u16) -> Option<Self> {
+    ///
+    /// `hand_bit_limit`: 手駒 decode を打ち切る bit 位置 (= 駒種 huffman 後の cursor)。
+    /// .pack の HCP は 32 byte = 256 bit までを使うので 256 を渡す。
+    /// hcpe (= 32 byte 中、 末尾 8 byte が教師) では HCP 本体は 192 bit に収まる
+    /// (= cshogi/Apery HCP の符号化が 192 bit 以内、 残り 64 bit は教師領域に上書き済)
+    /// ため 192 を渡し、 教師 byte を hand 駒として誤認しないように制限する。
+    ///
+    /// `use_yo_table`: 盤上駒の Huffman table を YO_HUFFMAN_TABLE で読む (= KNIGHT 0x0b /
+    /// SILVER 0x07)。 false のときは HCP_HUFFMAN_TABLE (= KNIGHT 0x07 / SILVER 0x0b)。
+    /// .pack 由来の HCP は HCP_HUFFMAN_TABLE で動いていたが、 dlshogi/cshogi の
+    /// HuffmanCodedPosAndEval は実装によって table が異なる可能性があり、 hcpe loader が
+    /// 切替可能であることで両方の dataset を試せるようにする。
+    pub(super) fn from_hcp(hcp: &[u8; 32], game_ply: u16, hand_bit_limit: usize, use_yo_table: bool) -> Option<Self> {
         let mut pos = Self { board: [Piece::NONE; 81], hands: [Hand::EMPTY; 2], side_to_move: Color::Black, game_ply };
 
         let mut stream = BitReader::new(hcp);
@@ -351,7 +365,8 @@ impl MiniPosition {
             if sq == bk as usize || sq == wk as usize {
                 continue;
             }
-            let idx = decode_huffman(&mut stream, &HCP_HUFFMAN_TABLE)?;
+            let table = if use_yo_table { &YO_HUFFMAN_TABLE } else { &HCP_HUFFMAN_TABLE };
+            let idx = decode_huffman(&mut stream, table)?;
             if idx == 0 {
                 continue; // 空マス
             }
@@ -366,7 +381,9 @@ impl MiniPosition {
         }
 
         // 手駒/駒箱 (HCP 独自 prefix-free コード)
-        while stream.cursor() < 256 {
+        // hand_bit_limit (= 192 or 256) で打ち切ることで hcpe (= HCP + 末尾教師 8 byte) の
+        // 教師 byte を hand 駒として誤認しないようにする。
+        while stream.cursor() < hand_bit_limit {
             let (piece_idx, color, is_piecebox) = decode_hcp_hand_entry(&mut stream)?;
             if is_piecebox {
                 continue;
@@ -529,7 +546,7 @@ impl MiniPosition {
     }
 
     /// 現在の局面から PackedSfenValue を生成
-    fn to_packed_sfen_value(&self, score: i16, move16: u16, game_result: i8) -> PackedSfenValue {
+    pub(super) fn to_packed_sfen_value(&self, score: i16, move16: u16, game_result: i8) -> PackedSfenValue {
         let psfen = self.pack_to_psfen();
         let mut data = [0u8; 40];
         data[0..32].copy_from_slice(&psfen);
@@ -550,7 +567,7 @@ impl MiniPosition {
 
 impl PackedSfenValue {
     /// 生のバイト配列から PackedSfenValue を構築
-    fn from_raw(data: [u8; 40]) -> Self {
+    pub(super) fn from_raw(data: [u8; 40]) -> Self {
         // Safety: PackedSfenValue は #[repr(C)] の [u8; 40] ラッパー
         // data フィールドへの直接アクセス手段が as_bytes_mut のみのため、
         // デフォルト値を生成してからコピーする
@@ -661,7 +678,7 @@ fn read_one_game(cursor: &mut PackCursor) -> Option<RawGameData> {
         0 => {
             let hcp = cursor.read_bytes_32()?;
             let game_ply = cursor.read_u16()?;
-            MiniPosition::from_hcp(&hcp, game_ply)?
+            MiniPosition::from_hcp(&hcp, game_ply, 256, false)?
         }
         _ => return None,
     };

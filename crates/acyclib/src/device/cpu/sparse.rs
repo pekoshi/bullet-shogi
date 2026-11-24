@@ -52,6 +52,9 @@ impl SparseAffineOps for CpuThread {
             DiffableFromOutput::SCReLU => affine_fwd(nnz, m, k, a, x, v, b, bb, y, |x| x.clamp(0.0, 1.0).powi(2)),
             DiffableFromOutput::SqrReLU => affine_fwd(nnz, m, k, a, x, v, b, bb, y, |x| x.max(0.0).powi(2)),
             DiffableFromOutput::Sigmoid => affine_fwd(nnz, m, k, a, x, v, b, bb, y, |x| 1.0 / (1.0 + (-x).exp())),
+            DiffableFromOutput::LeakyReLU => {
+                affine_fwd(nnz, m, k, a, x, v, b, bb, y, |x| if x > 0.0 { x } else { 0.01 * x })
+            }
         }
 
         Ok(())
@@ -124,6 +127,9 @@ impl SparseAffineOps for CpuThread {
             }
             DiffableFromOutput::SqrReLU => affine_bwd(nnz, m, k, x, v, y, yg, bb, ag, bg, |x| 2.0 * x.max(0.0).sqrt()),
             DiffableFromOutput::Sigmoid => affine_bwd(nnz, m, k, x, v, y, yg, bb, ag, bg, |x| x * (1.0 - x)),
+            DiffableFromOutput::LeakyReLU => {
+                affine_bwd(nnz, m, k, x, v, y, yg, bb, ag, bg, |x| if x > 0.0 { 1.0 } else { 0.01 })
+            }
         }
 
         Ok(())

@@ -6,7 +6,7 @@ mod sparse;
 
 use std::{num::NonZeroUsize, sync::Arc};
 
-pub use dense::{DenseMatrix, read_from_byte_buffer};
+pub use dense::{DenseMatrix, DenseMatrixF16, read_from_byte_buffer};
 pub use matrix::Matrix;
 pub use shape::Shape;
 pub use sparse::SparseMatrix;
@@ -35,7 +35,10 @@ impl<D: Device> TensorRef<D> {
         self.inner.try_read().unwrap()
     }
 
-    pub(crate) fn borrow_mut(&self) -> RwLockWriteGuard<'_, Tensor<D>> {
+    /// 2026-06-09: 外部 crate (= bullet_lib::value::run_with_bucket_smoothness) から weight
+    /// 直接書き戻しを可能にするため `pub` に昇格。 内部使用 callers は変更なし、 lock 動作
+    /// (= `try_write().unwrap()`) も不変。 production hot path での使用は想定外。
+    pub fn borrow_mut(&self) -> RwLockWriteGuard<'_, Tensor<D>> {
         self.inner.try_write().unwrap()
     }
 

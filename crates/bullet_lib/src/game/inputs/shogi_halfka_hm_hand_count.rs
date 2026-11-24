@@ -70,9 +70,22 @@ impl SparseInputType for ShogiHalfKaHmHandCount {
         let stm = board.side_to_move;
         let nstm = stm.opponent();
 
+        // 2026-11-07 (T1 / fable 設計 DESIGN-20261107-HANDFEAT-FABLE.md §3 候補 A):
+        //   **素の枚数 (0.0〜18.0) をそのまま出してはいけない**。
+        //   エンジンの fc0 は u8 x i8 の `maddubs` で、 u8 lane は **126 以下**でなければ
+        //   飽和不変条件 (a <= 126 かつ |w| <= 127 で 2 項の和 <= 32,004) が壊れる。
+        //   「1.0 = 127」の目盛りなので、 枚数 c を素で送ると 127c で即破綻する。
+        //
+        //   そこで駒種ごとの係数 k を掛け、 **u8 の値が k*c (<= 126)** になるようにする:
+        //     歩 7 (最大 18 枚 -> 126) / 香 桂 銀 金 31 (最大 4 枚 -> 124)
+        //     角 飛 63 (最大 2 枚 -> 126)
+        //   学習器は `k*c / 127` を出し、 エンジンは `u8 = k*c` を送る -> 目盛りが一致する。
+        //   🚨HAND_PIECE_TYPES の順は **歩 香 桂 銀 金 角 飛**。 YO の PieceType 順
+        //     (歩 香 桂 銀 **角 飛 金**) とは違うので、 エンジン側 (E2) は必ずこの順で埋める。
+        const HC_SCALE: [f32; 7] = [7.0, 31.0, 31.0, 31.0, 31.0, 63.0, 63.0];
         let write = |out: &mut [f32], offset: usize, color: Color, board: &ShogiBoard| {
             for (i, &pt) in HAND_PIECE_TYPES.iter().enumerate() {
-                out[offset + i] = f32::from(board.hand(color).count(pt));
+                out[offset + i] = HC_SCALE[i] * f32::from(board.hand(color).count(pt)) / 127.0;
             }
         };
 

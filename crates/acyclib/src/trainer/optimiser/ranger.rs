@@ -5,7 +5,10 @@ use std::{
     sync::Arc,
 };
 
-use crate::device::{Device, OperationError, tensor::DenseMatrix};
+use crate::{
+    device::{Device, OperationError, tensor::DenseMatrix},
+    graph::CheckpointShapeAdapter,
+};
 
 use super::{
     OptimiserState, WrapOptimiser,
@@ -32,6 +35,12 @@ pub struct RangerLookahead<D: Device, S> {
     alpha: f32,
     k: usize,
     step: usize,
+    // Lookahead slow weights は θ₀(初期重み)から開始すべき(Lookahead論文)。
+    // zeroed 初期化のまま最初の lerp を行うと slow=0 → weights=0.5*weights と全重み半減する
+    // (resume-from-quantised で顕著、[[ranger_halving_confirmed_current_fork_20260727]])。
+    // 初回 update で slow←weights を1度だけコピーして θ₀ 初期化する。checkpoint resume 時は
+    // slow.bin ロード済ゆえ true をセットしてこのコピーをスキップ(ロード値を保持)。
+    slow_initialized: bool,
 }
 
 impl<D: Device, S: OptimiserState<D>> OptimiserState<D> for RangerLookahead<D, S> {
@@ -44,6 +53,7 @@ impl<D: Device, S: OptimiserState<D>> OptimiserState<D> for RangerLookahead<D, S
             alpha: params.alpha,
             k: params.k,
             step: 0,
+            slow_initialized: false,
         })
     }
 
@@ -55,6 +65,14 @@ impl<D: Device, S: OptimiserState<D>> OptimiserState<D> for RangerLookahead<D, S
         learning_rate: f32,
     ) -> Result<(), OperationError<D::DeviceError>> {
         self.step += 1;
+
+        // 半減バグ修正: 初回 update で slow←θ₀(=このstep更新前のweights)を初期化。
+        // これで step==k の lerp が slow=0.5*θ₀+0.5*weights≈weights となり半減しない。
+        if !self.slow_initialized {
+            self.slow_params.copy_from(weights)?;
+            self.slow_initialized = true;
+        }
+
         self.inner.update(weights, grads, gradient_factor, learning_rate)?;
 
         if self.step % self.k == 0 {
@@ -74,6 +92,10 @@ impl<D: Device, S: OptimiserState<D>> OptimiserState<D> for RangerLookahead<D, S
         Ok(())
     }
 
+    fn init_velocity(&mut self, value: f32) -> Result<(), D::DeviceError> {
+        self.inner.init_velocity(value)
+    }
+
     fn set_params(&mut self, params: Self::Params) {
         self.inner.set_params(params.inner);
         self.alpha = params.alpha;
@@ -84,12 +106,37 @@ impl<D: Device, S: OptimiserState<D>> OptimiserState<D> for RangerLookahead<D, S
         map: &mut HashMap<String, &mut Self>,
         path: &str,
         old_format: bool,
+        adapter: &dyn CheckpointShapeAdapter,
     ) -> Result<(), OperationError<D::DeviceError>> {
         let slow_params = utils::load_weights_from_file(&format!("{path}/slow.bin"), old_format);
+        let skip_unknown = std::env::var("BULLET_SKIP_UNKNOWN_WEIGHTS")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
 
         for (id, par) in &slow_params {
-            let single = map.get_mut(id).unwrap();
-            single.slow_params.load_from_slice(None, par)?;
+            let Some(single) = map.get_mut(id) else {
+                if skip_unknown {
+                    eprintln!("warn: skip unknown weight in slow.bin: {id}");
+                    continue;
+                }
+                panic!("unknown weight in slow.bin: {id}");
+            };
+            // 要素数不一致は adapter (例: Direct15 head 展開) で graph 形状へ変換する。
+            let par = match utils::adapt_to_size::<D>(adapter, id, par, single.slow_params.size()) {
+                Ok(par) => par,
+                Err(_) if skip_unknown => {
+                    eprintln!(
+                        "warn: skip size-mismatch slow weight {id}: ckpt={} vs graph={}",
+                        par.len(),
+                        single.slow_params.size()
+                    );
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+            single.slow_params.load_from_slice(None, &par)?;
+            // checkpoint からロードした slow はθ₀初期化不要(ロード値を保持)。
+            single.slow_initialized = true;
         }
 
         // Restore Ranger lookahead step counter. Missing file (older checkpoints)
@@ -108,7 +155,7 @@ impl<D: Device, S: OptimiserState<D>> OptimiserState<D> for RangerLookahead<D, S
         }
 
         let mut map = map.iter_mut().map(|(id, single)| (id.clone(), &mut single.inner)).collect();
-        S::load_from_checkpoint(&mut map, path, old_format)
+        S::load_from_checkpoint(&mut map, path, old_format, adapter)
     }
 
     fn write_to_checkpoint(map: &HashMap<String, &Self>, path: &str) -> Result<(), D::DeviceError> {

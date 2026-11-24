@@ -16,6 +16,10 @@ pub mod nn;
 /// associated structs for its use
 pub mod trainer;
 
+/// 隣接 bucket smoothness regularization (= 2026-06-09 追加、 訓練時のみ)
+pub mod bucket_smoothness;
+pub mod l1_decorrelation;
+
 /// Contains `ValueTrainer`, the new and improved
 /// way to train value networks.
 pub mod value;

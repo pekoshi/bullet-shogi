@@ -4,15 +4,16 @@ mod matmul;
 pub mod sparse;
 
 pub use backend::ExecutionContext;
-use backend::{bindings, ops, util, Buffer};
+use backend::{Buffer, bindings, ops, util};
 
 use acyclib::{
     device::{
+        Device, DeviceBuffer, OperationError,
         operation::{
-            AdamConfig, BaseOperations, BlasOperations, CoreDeviceOps, DiffableFromOutput, GemmConfig, SparseAffineOps,
+            AdamConfig, BaseOperations, BlasOperations, CoreDeviceOps, DiffableFromOutput, GemmConfig, Ranger21Config,
+            SparseAffineOps,
         },
         tensor::{self, Shape},
-        Device, DeviceBuffer, OperationError,
     },
     graph::ir::BackendMarker,
 };
@@ -33,21 +34,13 @@ pub enum DeviceError {
 
 impl From<bindings::cublasStatus_t> for Result<(), DeviceError> {
     fn from(value: bindings::cublasStatus_t) -> Self {
-        if value == bindings::CUBLAS_SUCCESS {
-            Ok(())
-        } else {
-            Err(DeviceError::Cublas(value))
-        }
+        if value == bindings::CUBLAS_SUCCESS { Ok(()) } else { Err(DeviceError::Cublas(value)) }
     }
 }
 
 impl From<bindings::cudaError_t> for Result<(), DeviceError> {
     fn from(value: bindings::cudaError_t) -> Self {
-        if value == bindings::SUCCESS {
-            Ok(())
-        } else {
-            Err(DeviceError::Cuda(value))
-        }
+        if value == bindings::SUCCESS { Ok(()) } else { Err(DeviceError::Cuda(value)) }
     }
 }
 
@@ -80,6 +73,24 @@ impl BaseOperations for Buffer<f32> {
         Ok(())
     }
 
+    fn set_range_to(&mut self, start: usize, end: usize, val: f32) -> Result<(), Self::BaseError> {
+        if start > end || end > self.size() {
+            return Err(DeviceError::ExpectedIllegalAddressAccess);
+        }
+        if start == end {
+            return Ok(());
+        }
+
+        // SAFETY: `start < end <= self.size()` を上で検証済み。 `mut_ptr().add(start)` は
+        // buffer 内の有効な device pointer であり、 書き込み範囲 `end - start` は buffer 末尾を
+        // 超えない。
+        unsafe {
+            ops::set(self.mut_ptr().add(start), end - start, val);
+        }
+
+        Ok(())
+    }
+
     fn diffable_from_output_fwd(
         &mut self,
         size: usize,
@@ -93,6 +104,7 @@ impl BaseOperations for Buffer<f32> {
             DiffableFromOutput::SCReLU => dense::screlu(size, a, self),
             DiffableFromOutput::SqrReLU => dense::sqrrelu(size, a, self),
             DiffableFromOutput::Sigmoid => dense::sigmoid(size, a, self),
+            DiffableFromOutput::LeakyReLU => dense::leaky_relu(size, a, self),
         }
     }
 
@@ -110,6 +122,7 @@ impl BaseOperations for Buffer<f32> {
             DiffableFromOutput::SCReLU => dense::screlu_backward(size, a, self, grd),
             DiffableFromOutput::SqrReLU => dense::sqrrelu_backward(size, a, self, grd),
             DiffableFromOutput::Sigmoid => dense::sigmoid_backward(size, a, self, grd),
+            DiffableFromOutput::LeakyReLU => dense::leaky_relu_backward(size, a, self, grd),
         }
     }
 
@@ -193,6 +206,49 @@ impl BaseOperations for Buffer<f32> {
         Ok(())
     }
 
+    fn silu_fwd(&mut self, size: usize, input: &Self) -> Result<(), Self::BaseError> {
+        dense::silu(size, input, self)
+    }
+
+    fn silu_bwd(&mut self, size: usize, input: &Self, output_grad: &Self) -> Result<(), Self::BaseError> {
+        dense::silu_backward(size, input, self, output_grad)
+    }
+
+    fn rms_norm_fwd(
+        &mut self,
+        _feature_size: usize,
+        _batch_size: usize,
+        _eps: f32,
+        _input: &Self,
+    ) -> Result<(), Self::BaseError> {
+        unimplemented!("RmsNorm not yet implemented for HIP backend; use CPU or CUDA backend")
+    }
+
+    fn rms_norm_bwd(
+        &mut self,
+        _feature_size: usize,
+        _batch_size: usize,
+        _eps: f32,
+        _input: &Self,
+        _output_grad: &Self,
+    ) -> Result<(), Self::BaseError> {
+        unimplemented!("RmsNorm not yet implemented for HIP backend; use CPU or CUDA backend")
+    }
+
+    fn softmax_fwd(&mut self, _feature_size: usize, _batch_size: usize, _input: &Self) -> Result<(), Self::BaseError> {
+        unimplemented!("standalone Softmax not yet implemented for HIP backend; use CPU or CUDA backend")
+    }
+
+    fn softmax_bwd(
+        &mut self,
+        _feature_size: usize,
+        _batch_size: usize,
+        _softmax_out: &Self,
+        _output_grad: &Self,
+    ) -> Result<(), Self::BaseError> {
+        unimplemented!("standalone Softmax not yet implemented for HIP backend; use CPU or CUDA backend")
+    }
+
     fn abs_pow_scalar_backward(
         &mut self,
         size: usize,
@@ -274,21 +330,21 @@ impl BaseOperations for Buffer<f32> {
         dense::adam(size, self, grd, mom, vel, config)
     }
 
-    fn clip(&mut self, size: usize, min: f32, max: f32) -> Result<(), Self::BaseError> {
-        dense::clip(size, self, min, max)
+    fn ranger21(
+        &mut self,
+        _config: &Ranger21Config,
+        _offset: usize,
+        _size: usize,
+        _grd: &Self,
+        _momentum: &mut Self,
+        _velocity: &mut Self,
+        _max_velocity: &mut Self,
+    ) -> Result<(), Self::BaseError> {
+        panic!("Ranger21 core is currently supported by the CUDA and CPU backends only")
     }
 
-    fn clip_with_repeated_offset(
-        &mut self,
-        rows: usize,
-        cols: usize,
-        offset: &Self,
-        offset_rows: usize,
-        offset_cols: usize,
-        min: f32,
-        max: f32,
-    ) -> Result<(), Self::BaseError> {
-        dense::clip_with_repeated_offset(rows, cols, self, offset, offset_rows, offset_cols, min, max)
+    fn clip(&mut self, size: usize, min: f32, max: f32) -> Result<(), Self::BaseError> {
+        dense::clip(size, self, min, max)
     }
 }
 
@@ -302,6 +358,7 @@ impl Device for ExecutionContext {
     type Marker = HipMarker;
     type BufferF32 = Buffer<f32>;
     type BufferI32 = Buffer<i32>;
+    type BufferF16 = Buffer<half::f16>;
     type DeviceError = DeviceError;
     type IdType = ();
 

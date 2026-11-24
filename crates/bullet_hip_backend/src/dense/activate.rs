@@ -45,3 +45,5 @@ define_activation!(crelu, crelu_backward, activateCReLU, backpropCReLU);
 define_activation!(screlu, screlu_backward, activateSCReLU, backpropSCReLU);
 define_activation!(sqrrelu, sqrrelu_backward, activateSqrReLU, backpropSqrReLU);
 define_activation!(sigmoid, sigmoid_backward, activateSigmoid, backpropSigmoid);
+define_activation!(silu, silu_backward, activateSiLU, backpropSiLU);
+define_activation!(leaky_relu, leaky_relu_backward, activateLeakyReLU, backpropLeakyReLU);

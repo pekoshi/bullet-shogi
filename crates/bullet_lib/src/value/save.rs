@@ -9,7 +9,7 @@ use crate::{
 };
 use acyclib::{
     graph::{
-        GraphNodeId, GraphNodeIdTy,
+        CheckpointShapeAdapter, GraphNodeId, GraphNodeIdTy,
         like::GraphLike,
         save::{GraphWeights, QuantTarget},
     },
@@ -67,19 +67,58 @@ where
 
     let mut buf = Vec::new();
 
-    for fmt in &trainer.state.saved_format {
-        if let Some(id) = &fmt.get_id() {
+    let has_any_id = trainer.state.saved_format.iter().any(|fmt| fmt.get_id().is_some());
+
+    if has_any_id {
+        for fmt in &trainer.state.saved_format {
+            if let Some(id) = &fmt.get_id() {
+                let idx =
+                    GraphNodeId::new(trainer.optimiser.graph.primary().weight_idx(id).unwrap(), GraphNodeIdTy::Values);
+                let weights = trainer.optimiser.graph.primary().get(idx).unwrap();
+                let weights = weights.dense();
+
+                let mut weight_buf = vec![0.0; weights.size()];
+                let written = weights.write_to_slice(&mut weight_buf).unwrap();
+                assert_eq!(written, weights.size());
+
+                let quantised = QuantTarget::Float.quantise(false, &weight_buf)?;
+                buf.extend_from_slice(&quantised);
+            }
+        }
+    } else {
+        // Fallback: SavedFormat に id 付きが無い (= custom transform-only 形式、 例: rshogi format)。
+        // raw.bin が 0 byte になる bug を回避するため graph 全 weight を ID 順に f32 dump。
+        // フォーマット: magic "BULLETRW" (8 byte) + version u32 (=1) + weight count u32
+        //              + 各 weight: id_len u32 + id bytes + size u32 + f32 weights (size * 4 byte)
+        const MAGIC: &[u8; 8] = b"BULLETRW";
+        const VERSION: u32 = 1;
+
+        buf.extend_from_slice(MAGIC);
+        buf.extend_from_slice(&VERSION.to_le_bytes());
+
+        let mut weight_ids = trainer.optimiser.graph.primary().weight_ids();
+        weight_ids.sort();
+        let count = weight_ids.len() as u32;
+        buf.extend_from_slice(&count.to_le_bytes());
+
+        for id in &weight_ids {
             let idx =
                 GraphNodeId::new(trainer.optimiser.graph.primary().weight_idx(id).unwrap(), GraphNodeIdTy::Values);
             let weights = trainer.optimiser.graph.primary().get(idx).unwrap();
             let weights = weights.dense();
+            let size = weights.size();
 
-            let mut weight_buf = vec![0.0; weights.size()];
+            let mut weight_buf = vec![0.0f32; size];
             let written = weights.write_to_slice(&mut weight_buf).unwrap();
-            assert_eq!(written, weights.size());
+            assert_eq!(written, size);
 
-            let quantised = QuantTarget::Float.quantise(false, &weight_buf)?;
-            buf.extend_from_slice(&quantised);
+            let id_bytes = id.as_bytes();
+            buf.extend_from_slice(&(id_bytes.len() as u32).to_le_bytes());
+            buf.extend_from_slice(id_bytes);
+            buf.extend_from_slice(&(size as u32).to_le_bytes());
+            for w in &weight_buf {
+                buf.extend_from_slice(&w.to_le_bytes());
+            }
         }
     }
 
@@ -132,6 +171,18 @@ where
 {
     pub fn load_from_checkpoint(&mut self, path: &str) {
         let err = self.optimiser.load_from_checkpoint(&format!("{path}/optimiser_state"));
+        if let Err(e) = err {
+            println!();
+            println!("Error loading from checkpoint:");
+            println!("{e:?}");
+            std::process::exit(1);
+        }
+    }
+
+    /// [`Self::load_from_checkpoint`] と同じだが、 graph と要素数が一致しないテンソル
+    /// (重み・optimiser state とも) を `adapter` で graph 側の形状へ変換して読み込む。
+    pub fn load_from_checkpoint_adapted(&mut self, path: &str, adapter: &dyn CheckpointShapeAdapter) {
+        let err = self.optimiser.load_from_checkpoint_adapted(&format!("{path}/optimiser_state"), adapter);
         if let Err(e) = err {
             println!();
             println!("Error loading from checkpoint:");

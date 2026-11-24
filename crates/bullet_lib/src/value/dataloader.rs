@@ -97,6 +97,22 @@ impl<I: SparseInputType, O> From<PreparedData<I, O>> for PreparedBatchHost {
             let _ = host_data.inputs.insert("hand_count".to_string(), HostMatrix::Dense(hand_count));
         }
 
+        // LMAS など hand_count 以外の auxiliary dense 入力を name 一致で host_data に追加。
+        // entries が空 (既存 input type) のときはこの block は no-op。
+        for (name, DenseInput { value, shape }) in prepared_data.auxiliary {
+            let dense = HostDenseMatrix::new(value, Some(batch_size), shape);
+            let _ = host_data.inputs.insert(name, HostMatrix::Dense(dense));
+        }
+
+        // Dual PSQT King-Attacker 等の大次元 sparse aux 入力を name 一致で host_data に追加。
+        // entries が空 (既定) のときはこの block は no-op。
+        unsafe {
+            for (name, SparseInput { value, max_active, shape }) in prepared_data.auxiliary_sparse {
+                let sparse = HostSparseMatrix::new(value, Some(batch_size), shape, max_active);
+                let _ = host_data.inputs.insert(name, HostMatrix::Sparse(sparse));
+            }
+        }
+
         host_data
     }
 }

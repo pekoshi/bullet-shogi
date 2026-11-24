@@ -11,15 +11,22 @@
 
 use std::sync::LazyLock;
 
-use super::SparseInputType;
 use super::shogi_halfka::{
-    HALFKA_HM_DIMENSIONS, MAX_ACTIVE_FEATURES, halfka_index, is_hm_mirror, king_bonapiece, king_bucket, pack_bonapiece,
+    halfka_index, is_hm_mirror, king_bonapiece, king_bucket, pack_bonapiece, HALFKA_HM_DIMENSIONS, MAX_ACTIVE_FEATURES,
 };
+use super::shogi_halfka_hm_king_attacker_dual::{
+    fill_dual_cross_head, fill_dual_sparse_head, CrossHead, DualHead, DUAL_CROSS_DEFENDED_BLACK,
+    DUAL_CROSS_DEFENDED_WHITE, DUAL_CROSS_DIM_PER_HEAD, DUAL_CROSS_MAX_ACTIVE_PER_HEAD, DUAL_CROSS_THREAT_BLACK,
+    DUAL_CROSS_THREAT_WHITE, DUAL_DIM_PER_HEAD, DUAL_MAX_ACTIVE_PER_HEAD, DUAL_SPARSE_NAME_ATTACK_BLACK,
+    DUAL_SPARSE_NAME_ATTACK_WHITE, DUAL_SPARSE_NAME_DEFEND_BLACK, DUAL_SPARSE_NAME_DEFEND_WHITE,
+};
+use super::shogi_halfka_hm_pin::{pin_aux_entries, try_fill_pin_aux};
 use super::shogi_threat_exclusion::ThreatProfile;
+use super::SparseInputType;
 use crate::shogi::{
-    PackedSfenValue, ShogiBoard,
     bona_piece::BonaPiece,
-    types::{BOARD_PIECE_TYPES, Color, HAND_PIECE_TYPES, Piece, PieceType, Square},
+    types::{Color, Piece, PieceType, Square, BOARD_PIECE_TYPES, HAND_PIECE_TYPES},
+    PackedSfenValue, ShogiBoard,
 };
 
 // =============================================================================
@@ -30,7 +37,12 @@ use crate::shogi::{
 pub(super) const NUM_THREAT_CLASSES: usize = 9;
 
 /// active threat features の最大数（安全側の上限）
-const MAX_ACTIVE_THREAT_FEATURES: usize = 320;
+pub const MAX_ACTIVE_THREAT_FEATURES: usize = 320;
+pub const SCALAR_THREAT_DIMENSIONS: usize = 216_720;
+pub const SCALAR_THREAT_BUCKETS: usize = 8;
+pub const SCALAR_THREAT_WEIGHT_COUNT: usize = SCALAR_THREAT_DIMENSIONS * SCALAR_THREAT_BUCKETS;
+pub const SCALAR_THREAT_SPARSE_NAME_BLACK: &str = "scalar_threat_black";
+pub const SCALAR_THREAT_SPARSE_NAME_WHITE: &str = "scalar_threat_white";
 
 /// 最大アクティブ特徴数の合計（HalfKA_hm 40 + Threat 320）
 const MAX_ACTIVE_TOTAL: usize = MAX_ACTIVE_FEATURES + MAX_ACTIVE_THREAT_FEATURES;
@@ -124,6 +136,27 @@ fn build_pair_base(profile: ThreatProfile) -> ([usize; NUM_PAIRS], usize) {
     (table, cumulative)
 }
 
+/// 指定 profile の threat pair レイアウトを返す (重み移植ツール用)。
+///
+/// 返り値の各要素は `(pair_index, base, len)`:
+/// - `pair_index` = `attacker_side * 162 + ac * 18 + attacked_side * 9 + dc`
+/// - `base` = その pair の threat feature 開始 index
+/// - `len` = その pair が占める feature 数 (= 空盤面利き数)
+///
+/// 除外された pair は含まれない。要素は `base` 昇順。
+pub fn threat_pair_layout(profile: ThreatProfile) -> Vec<(usize, usize, usize)> {
+    let (table, _) = build_pair_base(profile);
+    let mut out = Vec::new();
+    for (idx, &base) in table.iter().enumerate() {
+        if base != EXCLUDED_PAIR_BASE {
+            let ac = (idx % 162) / 18;
+            out.push((idx, base, ATTACKS_PER_COLOR[ac]));
+        }
+    }
+    out.sort_by_key(|&(_, base, _)| base);
+    out
+}
+
 /// pair_base テーブルから値を取得。除外された pair は None を返す。
 #[inline]
 fn lookup_pair_base(
@@ -135,7 +168,11 @@ fn lookup_pair_base(
 ) -> Option<usize> {
     let idx = attacker_side * 162 + (ac as usize) * 18 + attacked_side * 9 + dc as usize;
     let base = pair_base[idx];
-    if base == EXCLUDED_PAIR_BASE { None } else { Some(base) }
+    if base == EXCLUDED_PAIR_BASE {
+        None
+    } else {
+        Some(base)
+    }
 }
 
 // =============================================================================
@@ -504,7 +541,11 @@ impl Occupied {
 
     #[inline]
     pub(super) fn is_occupied(&self, sq: u8) -> bool {
-        if sq < 64 { (self.bits[0] >> sq) & 1 != 0 } else { (self.bits[1] >> (sq - 64)) & 1 != 0 }
+        if sq < 64 {
+            (self.bits[0] >> sq) & 1 != 0
+        } else {
+            (self.bits[1] >> (sq - 64)) & 1 != 0
+        }
     }
 }
 
@@ -669,7 +710,11 @@ pub(super) fn for_each_attack<F: FnMut(Square)>(
 #[inline]
 pub(super) fn normalize_sq(sq: Square, perspective: Color, hm_mirror: bool) -> Square {
     let sq_n = if perspective == Color::Black { sq } else { sq.inverse() };
-    if hm_mirror { sq_n.mirror_file() } else { sq_n }
+    if hm_mirror {
+        sq_n.mirror_file()
+    } else {
+        sq_n
+    }
 }
 
 // =============================================================================
@@ -732,13 +777,56 @@ pub struct ShogiHalfKaHmThreat {
     profile: ThreatProfile,
     pair_base: Box<[usize; NUM_PAIRS]>,
     threat_dims: usize,
+    /// Pin-aware 補助入力を有効化するか。
+    ///
+    /// `true` のとき `auxiliary_dense_dims` に `pin_features_black/white` (各 2,268 dim)
+    /// を追加し、 fill 時に `pin_features::fill_pin_features_for_side` で dense vector
+    /// を生成する。 Threat + Pin combined input をサポート。
+    pin_aware: bool,
+    /// Dual PSQT king-attacker用のauxiliary sparse入力を供給するか。
+    dual_psqt_enabled: bool,
+    /// king-attackerのattack/defend 4 headを供給するか。
+    dual_king_attacker_enabled: bool,
+    /// D2 crossのdefended 2 headを供給するか。
+    dual_cross_defended_enabled: bool,
 }
 
 impl ShogiHalfKaHmThreat {
-    /// 指定 profile で構築
+    /// 指定 profile で構築 (pin_aware off)。
     pub fn new(profile: ThreatProfile) -> Self {
         let (pair_base, threat_dims) = build_pair_base(profile);
-        Self { profile, pair_base: Box::new(pair_base), threat_dims }
+        Self {
+            profile,
+            pair_base: Box::new(pair_base),
+            threat_dims,
+            pin_aware: false,
+            dual_psqt_enabled: false,
+            dual_king_attacker_enabled: false,
+            dual_cross_defended_enabled: false,
+        }
+    }
+
+    /// pin_aware on で構築する builder。
+    pub fn with_pin_aware(mut self, enabled: bool) -> Self {
+        self.pin_aware = enabled;
+        self
+    }
+
+    /// pin_aware の有効状態を返す。
+    pub fn pin_aware(&self) -> bool {
+        self.pin_aware
+    }
+
+    /// Dual PSQT king-attackerのauxiliary sparse入力を有効化する。
+    ///
+    /// Threat本体のFT sparse入力に加え、グラフが要求するattack/defendとD2 crossの
+    /// sparse入力を同じPackedSfenValueから供給する。これにより、未充填sparse入力の
+    /// batch=Noneと主出力batch=Some(N)が加算されることを防ぐ。
+    pub fn with_dual_psqt(mut self, enabled: bool, king_attacker_enabled: bool, cross_defended_enabled: bool) -> Self {
+        self.dual_psqt_enabled = enabled;
+        self.dual_king_attacker_enabled = enabled && king_attacker_enabled;
+        self.dual_cross_defended_enabled = enabled && cross_defended_enabled;
+        self
     }
 
     /// Threat 特徴量の次元数
@@ -750,6 +838,29 @@ impl ShogiHalfKaHmThreat {
     pub fn profile(&self) -> ThreatProfile {
         self.profile
     }
+}
+
+/// Full profile Threatを絶対色perspectiveで列挙し、feature-major bucket indexを返す。
+pub fn fill_scalar_threat_for_perspective(
+    pos: &PackedSfenValue,
+    perspective: Color,
+    bucket: usize,
+    out: &mut [i32],
+) -> usize {
+    debug_assert!(bucket < SCALAR_THREAT_BUCKETS);
+    let board = ShogiBoard::from_packed_sfen(pos);
+    let stm = board.side_to_move;
+    static INPUT: LazyLock<ShogiHalfKaHmThreat> = LazyLock::new(|| ShogiHalfKaHmThreat::new(ThreatProfile::Full));
+    let mut written = 0usize;
+    INPUT.map_features(pos, |stm_idx, nstm_idx| {
+        let combined = if perspective == stm { stm_idx } else { nstm_idx };
+        if combined >= HALFKA_HM_DIMENSIONS && written < out.len() {
+            let feature = combined - HALFKA_HM_DIMENSIONS;
+            out[written] = (feature * SCALAR_THREAT_BUCKETS + bucket) as i32;
+            written += 1;
+        }
+    });
+    written
 }
 
 impl SparseInputType for ShogiHalfKaHmThreat {
@@ -769,14 +880,71 @@ impl SparseInputType for ShogiHalfKaHmThreat {
     }
 
     fn shorthand(&self) -> String {
-        format!("shogi-{}x45hm+threat", HALFKA_HM_DIMENSIONS + self.threat_dims)
+        let pin_part = if self.pin_aware { "+pin" } else { "" };
+        format!("shogi-{}x45hm+threat{}", HALFKA_HM_DIMENSIONS + self.threat_dims, pin_part)
     }
 
     fn description(&self) -> String {
+        let pin_part = if self.pin_aware { " + Pin-aware (2,268 × 2 perspective)" } else { "" };
         format!(
-            "Shogi HalfKA_hm ({}) + Threat ({}, profile={}) concatenated",
-            HALFKA_HM_DIMENSIONS, self.threat_dims, self.profile
+            "Shogi HalfKA_hm ({}) + Threat ({}, profile={}) concatenated{}",
+            HALFKA_HM_DIMENSIONS, self.threat_dims, self.profile, pin_part
         )
+    }
+
+    fn auxiliary_dense_dims(&self) -> Vec<(String, usize)> {
+        let mut dims: Vec<(String, usize)> = Vec::new();
+        if self.pin_aware {
+            for (name, d) in pin_aux_entries().iter() {
+                dims.push(((*name).to_string(), *d));
+            }
+        }
+        dims
+    }
+
+    fn fill_auxiliary_dense(&self, name: &str, pos: &Self::RequiredDataType, out: &mut [f32]) {
+        if self.pin_aware {
+            let _ = try_fill_pin_aux(name, pos, out);
+        }
+    }
+
+    fn auxiliary_sparse_dims(&self) -> Vec<(String, usize, usize)> {
+        if !self.dual_psqt_enabled {
+            return Vec::new();
+        }
+        let mut dims = Vec::new();
+        if self.dual_king_attacker_enabled {
+            dims.push((DUAL_SPARSE_NAME_ATTACK_BLACK.to_string(), DUAL_DIM_PER_HEAD, DUAL_MAX_ACTIVE_PER_HEAD));
+            dims.push((DUAL_SPARSE_NAME_DEFEND_BLACK.to_string(), DUAL_DIM_PER_HEAD, DUAL_MAX_ACTIVE_PER_HEAD));
+            dims.push((DUAL_SPARSE_NAME_ATTACK_WHITE.to_string(), DUAL_DIM_PER_HEAD, DUAL_MAX_ACTIVE_PER_HEAD));
+            dims.push((DUAL_SPARSE_NAME_DEFEND_WHITE.to_string(), DUAL_DIM_PER_HEAD, DUAL_MAX_ACTIVE_PER_HEAD));
+        }
+        dims.push((DUAL_CROSS_THREAT_BLACK.to_string(), DUAL_CROSS_DIM_PER_HEAD, DUAL_CROSS_MAX_ACTIVE_PER_HEAD));
+        if self.dual_cross_defended_enabled {
+            dims.push((DUAL_CROSS_DEFENDED_BLACK.to_string(), DUAL_CROSS_DIM_PER_HEAD, DUAL_CROSS_MAX_ACTIVE_PER_HEAD));
+        }
+        dims.push((DUAL_CROSS_THREAT_WHITE.to_string(), DUAL_CROSS_DIM_PER_HEAD, DUAL_CROSS_MAX_ACTIVE_PER_HEAD));
+        if self.dual_cross_defended_enabled {
+            dims.push((DUAL_CROSS_DEFENDED_WHITE.to_string(), DUAL_CROSS_DIM_PER_HEAD, DUAL_CROSS_MAX_ACTIVE_PER_HEAD));
+        }
+        dims
+    }
+
+    fn fill_auxiliary_sparse(&self, name: &str, pos: &Self::RequiredDataType, out: &mut [i32]) -> usize {
+        if !self.dual_psqt_enabled {
+            return 0;
+        }
+        match name {
+            DUAL_SPARSE_NAME_ATTACK_BLACK => fill_dual_sparse_head(pos, Color::Black, DualHead::Attack, out),
+            DUAL_SPARSE_NAME_DEFEND_BLACK => fill_dual_sparse_head(pos, Color::Black, DualHead::Defend, out),
+            DUAL_SPARSE_NAME_ATTACK_WHITE => fill_dual_sparse_head(pos, Color::White, DualHead::Attack, out),
+            DUAL_SPARSE_NAME_DEFEND_WHITE => fill_dual_sparse_head(pos, Color::White, DualHead::Defend, out),
+            DUAL_CROSS_THREAT_BLACK => fill_dual_cross_head(pos, Color::Black, CrossHead::Threat, out),
+            DUAL_CROSS_DEFENDED_BLACK => fill_dual_cross_head(pos, Color::Black, CrossHead::Defended, out),
+            DUAL_CROSS_THREAT_WHITE => fill_dual_cross_head(pos, Color::White, CrossHead::Threat, out),
+            DUAL_CROSS_DEFENDED_WHITE => fill_dual_cross_head(pos, Color::White, CrossHead::Defended, out),
+            _ => 0,
+        }
     }
 }
 
@@ -1009,9 +1177,38 @@ mod tests {
     }
 
     #[test]
+    fn test_no_pawn_target_dimensions() {
+        let input = ShogiHalfKaHmThreat::new(ThreatProfile::NoPawnTarget);
+        // dc == 0 (Pawn target) の pair を全除外 = (as, ds, dc) 36 通り -> 32 通り
+        // sum(ATTACKS_PER_COLOR) = 6020 -> 6020 * 32 = 192_640
+        assert_eq!(input.threat_dimensions(), 192_640);
+    }
+
+    /// NoPawnTarget profile で残る pair は Full の対応 pair と同じ長さのブロックであり、
+    /// Full -> NoPawnTarget の重み移植が「連続ブロックの並べ替え」で表現できることを確認する。
+    #[test]
+    fn test_no_pawn_target_layout_is_block_permutation_of_full() {
+        let full = threat_pair_layout(ThreatProfile::Full);
+        let npt = threat_pair_layout(ThreatProfile::NoPawnTarget);
+        assert_eq!(full.len(), 324);
+        assert_eq!(npt.len(), 288);
+
+        let mut expected_base = 0usize;
+        for &(pair_idx, base, len) in &npt {
+            assert_eq!(base, expected_base);
+            expected_base += len;
+            let dc = pair_idx % 9;
+            assert_ne!(dc, 0, "pawn target pair must be excluded");
+            let (_, _, full_len) = full[full.iter().position(|&(i, _, _)| i == pair_idx).unwrap()];
+            assert_eq!(len, full_len);
+        }
+        assert_eq!(expected_base, 192_640);
+    }
+
+    #[test]
     fn test_max_active() {
         let input = full_input();
-        assert_eq!(input.max_active(), 40 + 320);
+        assert_eq!(input.max_active(), 64 + 320);
     }
 
     #[test]
@@ -1331,6 +1528,74 @@ mod tests {
             stm_threat_indices,
             expected,
             "Canonical mismatch with rshogi! count: bullet={} vs expected={}",
+            stm_threat_indices.len(),
+            expected.len()
+        );
+    }
+
+    /// Canonical test vector (Profile 3 = no-pawn-target): 平手初期局面の threat index。
+    /// C++ / rshogi 側 no-pawn-target 実装との bit-exact 照合用。
+    #[test]
+    fn test_canonical_startpos_threat_indices_no_pawn_target() {
+        let mut board = ShogiBoard {
+            side_to_move: Color::Black,
+            black_king_sq: Square::new(4, 8),
+            white_king_sq: Square::new(4, 0),
+            ..Default::default()
+        };
+
+        board.board[board.black_king_sq.index()] = Piece::new(Color::Black, PieceType::King);
+        board.board[board.white_king_sq.index()] = Piece::new(Color::White, PieceType::King);
+
+        for file in 0..9u8 {
+            board.board[Square::new(file, 6).index()] = Piece::new(Color::Black, PieceType::Pawn);
+            board.board[Square::new(file, 2).index()] = Piece::new(Color::White, PieceType::Pawn);
+        }
+
+        board.board[Square::new(7, 7).index()] = Piece::new(Color::Black, PieceType::Bishop);
+        board.board[Square::new(1, 7).index()] = Piece::new(Color::Black, PieceType::Rook);
+        board.board[Square::new(1, 1).index()] = Piece::new(Color::White, PieceType::Bishop);
+        board.board[Square::new(7, 1).index()] = Piece::new(Color::White, PieceType::Rook);
+
+        board.board[Square::new(0, 8).index()] = Piece::new(Color::Black, PieceType::Lance);
+        board.board[Square::new(8, 8).index()] = Piece::new(Color::Black, PieceType::Lance);
+        board.board[Square::new(0, 0).index()] = Piece::new(Color::White, PieceType::Lance);
+        board.board[Square::new(8, 0).index()] = Piece::new(Color::White, PieceType::Lance);
+
+        board.board[Square::new(1, 8).index()] = Piece::new(Color::Black, PieceType::Knight);
+        board.board[Square::new(7, 8).index()] = Piece::new(Color::Black, PieceType::Knight);
+        board.board[Square::new(1, 0).index()] = Piece::new(Color::White, PieceType::Knight);
+        board.board[Square::new(7, 0).index()] = Piece::new(Color::White, PieceType::Knight);
+
+        board.board[Square::new(2, 8).index()] = Piece::new(Color::Black, PieceType::Silver);
+        board.board[Square::new(6, 8).index()] = Piece::new(Color::Black, PieceType::Silver);
+        board.board[Square::new(2, 0).index()] = Piece::new(Color::White, PieceType::Silver);
+        board.board[Square::new(6, 0).index()] = Piece::new(Color::White, PieceType::Silver);
+
+        board.board[Square::new(3, 8).index()] = Piece::new(Color::Black, PieceType::Gold);
+        board.board[Square::new(5, 8).index()] = Piece::new(Color::Black, PieceType::Gold);
+        board.board[Square::new(3, 0).index()] = Piece::new(Color::White, PieceType::Gold);
+        board.board[Square::new(5, 0).index()] = Piece::new(Color::White, PieceType::Gold);
+
+        let mut stm_threat_indices = Vec::new();
+        let input = ShogiHalfKaHmThreat::new(ThreatProfile::NoPawnTarget);
+        input.map_threat_features(&board, |stm_idx, _nstm_idx| {
+            if stm_idx >= HALFKA_HM_DIMENSIONS {
+                stm_threat_indices.push(stm_idx - HALFKA_HM_DIMENSIONS);
+            }
+        });
+        stm_threat_indices.sort();
+
+        #[rustfmt::skip]
+        let expected: Vec<usize> = vec![
+            9703, 9869, 14387, 14490, 20767, 22397, 34648, 38542,
+            108448, 108938, 113989, 114092, 122960, 124594, 142103, 145985,
+        ];
+
+        assert_eq!(
+            stm_threat_indices,
+            expected,
+            "Canonical mismatch (no-pawn-target)! count: bullet={} vs expected={}",
             stm_threat_indices.len(),
             expected.len()
         );

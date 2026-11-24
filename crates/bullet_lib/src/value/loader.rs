@@ -1,4 +1,5 @@
 mod direct;
+pub mod hcpe;
 mod montybinpack;
 mod rng;
 mod sfbinpack;
@@ -7,16 +8,16 @@ mod text;
 pub mod viribinpack;
 
 pub use direct::{CanBeDirectlySequentiallyLoaded, DirectSequentialDataLoader};
+pub use hcpe::{HCPE_RECORD_SIZE, HcpeLoader, looks_like_hcpe_file};
 pub use montybinpack::MontyBinpackLoader;
 pub use sfbinpack::SfBinpackLoader;
 pub use shogipack::ShogiPackLoader;
 pub use text::InMemoryTextLoader;
 pub use viribinpack::ViriBinpackLoader;
 
+use crate::game::{inputs::SparseInputType, outputs::OutputBuckets};
 use acyclib::device::tensor::Shape;
 use bulletformat::BulletFormat;
-
-use crate::game::{inputs::SparseInputType, outputs::OutputBuckets};
 
 use super::Wgt;
 
@@ -148,6 +149,20 @@ pub struct PreparedData<I: SparseInputType, O> {
     pub(crate) weights: DenseInput,
     /// HandCount dense auxiliary input。`I::hand_count_dims()` が `Some` のとき設定される。
     pub(crate) hand_count: Option<DenseInput>,
+    /// LMAS など hand_count 以外の auxiliary dense 入力。
+    ///
+    /// `I::auxiliary_dense_dims()` のうち "hand_count" を除いた entries を
+    /// `(name, DenseInput)` ペアで列挙し、 graph builder で `new_dense_input(name, ...)`
+    /// 宣言した dense 入力へ name 一致で渡される (dataloader.rs)。
+    /// 既存 input type は default impl 経由で空 Vec を返すため、 後方互換。
+    pub(crate) auxiliary: Vec<(String, DenseInput)>,
+    /// 大次元 sparse aux 入力 (= Dual PSQT King-Attacker 等)。
+    ///
+    /// `I::auxiliary_sparse_dims()` (= (name, dim, max_active)) から構築。 dense と違い
+    /// max_active 個の `i32` index を 1 sample あたり書き込む (= 末尾は -1 padding)。
+    /// graph builder で `new_sparse_input(name, Shape::new(dim, 1), max_active)` 宣言
+    /// した sparse 入力に対応。 既定 (= default impl) は空 Vec で後方互換。
+    pub(crate) auxiliary_sparse: Vec<(String, SparseInput)>,
 }
 
 impl<I, O> PreparedData<I, O>
@@ -181,6 +196,33 @@ where
         let hand_count_init =
             hand_count_dims.map(|dims| DenseInput { value: vec![0.0; dims * batch_size], shape: Shape::new(dims, 1) });
 
+        // auxiliary dense (LMAS など): hand_count を除く全 entry を batch 分確保。
+        // 既存 input type は default impl で空 Vec を返すため、 後方互換 (この Vec も空)。
+        let aux_dims_all: Vec<(String, usize)> = input_getter.auxiliary_dense_dims();
+        let aux_specs: Vec<(String, usize)> =
+            aux_dims_all.into_iter().filter(|(name, _)| name != "hand_count").collect();
+        let auxiliary_init: Vec<(String, DenseInput)> = aux_specs
+            .iter()
+            .map(|(name, dims)| {
+                (name.clone(), DenseInput { value: vec![0.0; *dims * batch_size], shape: Shape::new(*dims, 1) })
+            })
+            .collect();
+
+        // auxiliary sparse (Dual PSQT King-Attacker 等): 大次元 + 小 max_active な aux 入力を
+        // sparse で確保。 dense 297 MB / batch を回避し NPS 数倍化。 default impl は空 Vec。
+        let aux_sparse_specs: Vec<(String, usize, usize)> = input_getter.auxiliary_sparse_dims();
+        let auxiliary_sparse_init: Vec<(String, SparseInput)> = aux_sparse_specs
+            .iter()
+            .map(|(name, dim, max_active_aux)| {
+                let total = max_active_aux * batch_size;
+                // 末尾は -1 padding (= bullet sparse 慣例)
+                (
+                    name.clone(),
+                    SparseInput { max_active: *max_active_aux, value: vec![-1i32; total], shape: Shape::new(*dim, 1) },
+                )
+            })
+            .collect();
+
         let mut prep = Self {
             input_getter,
             output_getter,
@@ -191,6 +233,8 @@ where
             targets: DenseInput { value: vec![0.0; output_size * batch_size], shape: Shape::new(output_size, 1) },
             weights: DenseInput { value: vec![0.0; batch_size], shape: Shape::new(1, 1) },
             hand_count: hand_count_init,
+            auxiliary: auxiliary_init,
+            auxiliary_sparse: auxiliary_sparse_init,
         };
 
         let sparse_chunk_size = max_active * chunk_size;
@@ -293,6 +337,60 @@ where
                     },
                 );
         });
+
+        // auxiliary dense fill: hand_count 以外の dense 入力を name 一致で埋める。
+        // 既存 hand_count 経路と独立に動かす。 entries が空 (default impl) のときは
+        // この block は実質 no-op。
+        //
+        // 各 (name, DenseInput) は独立しているため entry 単位で並列化、 entry 内では
+        // batch を chunk_size で割って並列化。
+        if !prep.auxiliary.is_empty() {
+            let inp_aux = &prep.input_getter;
+            std::thread::scope(|s| {
+                for (name, dense) in prep.auxiliary.iter_mut() {
+                    let dims = dense.shape.size();
+                    let aux_chunk_size = dims * chunk_size;
+                    let name_ref: &str = name.as_str();
+                    for (data_chunk, aux_chunk) in data.chunks(chunk_size).zip(dense.value.chunks_mut(aux_chunk_size)) {
+                        s.spawn(move || {
+                            for (i, pos) in data_chunk.iter().enumerate() {
+                                let offset = dims * i;
+                                let end = offset + dims;
+                                // 事前に 0 で埋め済み。 fill_auxiliary_dense は書き込みのみ。
+                                inp_aux.fill_auxiliary_dense(name_ref, pos, &mut aux_chunk[offset..end]);
+                            }
+                        });
+                    }
+                }
+            });
+        }
+
+        // auxiliary sparse fill: dim が大 (= 18,144 等) で max_active が小 (= 50) な aux 入力を
+        // sparse 経路で埋める。 dense ベース 297 MB/batch の DMA を回避し NPS を数倍化。
+        // 既定 (= 空 Vec) では no-op。 各 sample で fill_auxiliary_sparse が active 数 n を返し、
+        // n..max_active_aux の末尾 slot は init 時の -1 padding がそのまま残る。
+        if !prep.auxiliary_sparse.is_empty() {
+            let inp_aux = &prep.input_getter;
+            std::thread::scope(|s| {
+                for (name, sparse) in prep.auxiliary_sparse.iter_mut() {
+                    let max_active_aux = sparse.max_active;
+                    let aux_chunk_elems = max_active_aux * chunk_size;
+                    let name_ref: &str = name.as_str();
+                    for (data_chunk, aux_chunk) in data.chunks(chunk_size).zip(sparse.value.chunks_mut(aux_chunk_elems))
+                    {
+                        s.spawn(move || {
+                            for (i, pos) in data_chunk.iter().enumerate() {
+                                let offset = max_active_aux * i;
+                                let end = offset + max_active_aux;
+                                // 末尾は init 時に -1 で埋め済み。 fill_auxiliary_sparse は
+                                // active index を先頭から書き込み、 戻り値の n は active 個数。
+                                let _n = inp_aux.fill_auxiliary_sparse(name_ref, pos, &mut aux_chunk[offset..end]);
+                            }
+                        });
+                    }
+                }
+            });
+        }
 
         prep
     }

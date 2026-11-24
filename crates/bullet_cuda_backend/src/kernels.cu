@@ -1,4 +1,5 @@
 #define BULLET_CUDA_UTILS
+#include <cuda_fp16.h>
 #define BULLET_KERNEL extern "C" __global__ void
 #define BULLET_KERNEL_IMPL __device__ __forceinline__ void
 
@@ -13,6 +14,8 @@ __device__ float CReLU(float in) { return in < 0.0F ? 0.0F : (in > 1.0F ? 1.0F :
 __device__ float SCReLU(float in) { return in < 0.0F ? 0.0F : (in > 1.0F ? 1.0F : (in * in)); }
 __device__ float SqrReLU(float in) { return in < 0.0F ? 0.0F : (in * in); }
 __device__ float sigmoid(float in) { return 1.0F / (1.0F + expf(-in)); }
+__device__ float SiLU(float in) { return in * sigmoid(in); }
+__device__ float LeakyReLU(float in) { return in > 0.0F ? in : 0.01F * in; }
 
 __device__ float primeIdentity([[maybe_unused]] float in) { return 1.0F; }
 __device__ float primeReLU(float in) { return in > 0.0F ? 1.0F : 0.0F; }
@@ -23,6 +26,11 @@ __device__ float primeSigmoid(float in) {
     const float act = sigmoid(in);
     return act * (1.0F - act);
 }
+__device__ float primeSiLU(float in) {
+    const float sig = sigmoid(in);
+    return sig * (1.0F + in * (1.0F - sig));
+}
+__device__ float primeLeakyReLU(float in) { return in > 0.0F ? 1.0F : 0.01F; }
 
 #define ACTIVATE(name, op)\
 BULLET_KERNEL name(const int size, const float* in, float* out)\
@@ -89,12 +97,138 @@ ACTIVATE(ForwardCreluKernel, CReLU)
 ACTIVATE(ForwardScreluKernel, SCReLU)
 ACTIVATE(ForwardSqrReluKernel, SqrReLU)
 ACTIVATE(ForwardSigmoidKernel, sigmoid)
+ACTIVATE(ForwardSiluKernel, SiLU)
+ACTIVATE(ForwardLeakyReluKernel, LeakyReLU)
 
 BACKPROP(BackwardReluKernel, primeReLU)
 BACKPROP(BackwardCreluKernel, primeCReLU)
 BACKPROP(BackwardScreluKernel, primeSCReLU)
 BACKPROP(BackwardSqrReluKernel, primeSqrReLU)
 BACKPROP(BackwardSigmoidKernel, primeSigmoid)
+BACKPROP(BackwardSiluKernel, primeSiLU)
+BACKPROP(BackwardLeakyReluKernel, primeLeakyReLU)
+
+// RMSNorm forward: per-sample (1 block = 1 sample)
+// out[i] = in[i] / sqrt(mean(in^2) + eps)
+BULLET_KERNEL RmsNormKernel(const int feature_size, const float eps, const float* input, float* output)
+{
+    const int sample = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int stride = blockDim.x;
+
+    const float* xs = input + sample * feature_size;
+    float* ys = output + sample * feature_size;
+
+    __shared__ float ssum[32];
+    if (tid < 32) ssum[tid] = 0.0F;
+    __syncthreads();
+
+    float local_sum_sq = 0.0F;
+    for (int i = tid; i < feature_size; i += stride) {
+        const float v = xs[i];
+        local_sum_sq += v * v;
+    }
+
+    // warp-level reduction
+    for (int offset = 16; offset > 0; offset /= 2) {
+        local_sum_sq += __shfl_down_sync(0xffffffff, local_sum_sq, offset);
+    }
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    if (lane == 0) ssum[warp] = local_sum_sq;
+    __syncthreads();
+
+    // block-level reduction (assume blockDim.x <= 1024 竊・32 warps)
+    float total = 0.0F;
+    if (tid < 32) {
+        const int n_warps = (stride + 31) / 32;
+        total = (tid < n_warps) ? ssum[tid] : 0.0F;
+        for (int offset = 16; offset > 0; offset /= 2) {
+            total += __shfl_down_sync(0xffffffff, total, offset);
+        }
+        if (tid == 0) ssum[0] = total;
+    }
+    __syncthreads();
+    total = ssum[0];
+
+    const float mean_sq = total / (float)feature_size;
+    const float rms_inv = rsqrtf(mean_sq + eps);
+
+    for (int i = tid; i < feature_size; i += stride) {
+        ys[i] = xs[i] * rms_inv;
+    }
+}
+
+// RMSNorm backward (accumulate):
+// rms = sqrt(mean(x^2) + eps)
+// input_grad[i] += output_grad[i] / rms - x[i] * sum(gﾂｷx) / (N * rms^3)
+BULLET_KERNEL RmsNormBackwardKernel(
+    const int feature_size,
+    const float eps,
+    const float* input,
+    const float* output_grad,
+    float* input_grad)
+{
+    const int sample = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int stride = blockDim.x;
+
+    const float* xs = input + sample * feature_size;
+    const float* gs = output_grad + sample * feature_size;
+    float* igs = input_grad + sample * feature_size;
+
+    __shared__ float ssum_sq[32];
+    __shared__ float sdot[32];
+    __shared__ float results[2];
+
+    float local_sq = 0.0F;
+    float local_dot = 0.0F;
+    for (int i = tid; i < feature_size; i += stride) {
+        const float x = xs[i];
+        const float g = gs[i];
+        local_sq += x * x;
+        local_dot += x * g;
+    }
+
+    for (int off = 16; off > 0; off /= 2) {
+        local_sq += __shfl_down_sync(0xffffffff, local_sq, off);
+        local_dot += __shfl_down_sync(0xffffffff, local_dot, off);
+    }
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    if (lane == 0) {
+        ssum_sq[warp] = local_sq;
+        sdot[warp] = local_dot;
+    }
+    __syncthreads();
+
+    if (tid < 32) {
+        const int n_warps = (stride + 31) / 32;
+        float r_sq = (tid < n_warps) ? ssum_sq[tid] : 0.0F;
+        float r_dot = (tid < n_warps) ? sdot[tid] : 0.0F;
+        for (int off = 16; off > 0; off /= 2) {
+            r_sq += __shfl_down_sync(0xffffffff, r_sq, off);
+            r_dot += __shfl_down_sync(0xffffffff, r_dot, off);
+        }
+        if (tid == 0) {
+            results[0] = r_sq;
+            results[1] = r_dot;
+        }
+    }
+    __syncthreads();
+
+    const float total_sq = results[0];
+    const float total_dot = results[1];
+    const float n_f = (float)feature_size;
+    const float mean_sq = total_sq / n_f;
+    const float rms = sqrtf(mean_sq + eps);
+    const float rms_inv = 1.0F / rms;
+    const float coef = total_dot / (n_f * rms * rms * rms);
+
+    for (int i = tid; i < feature_size; i += stride) {
+        igs[i] += gs[i] * rms_inv - xs[i] * coef;
+    }
+}
 
 BULLET_KERNEL ScaleAssignKernel(const int size, float* params, const float alpha) {
     const int tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -196,6 +330,8 @@ BULLET_KERNEL LinearCombKernel(const int size, const float alpha, const float* a
     }
 }
 
+
+
 BULLET_KERNEL_IMPL adamOp(
     const float beta1,
     const float beta2,
@@ -268,6 +404,90 @@ BULLET_KERNEL AdamKernel(
     }
 }
 
+// Profile15 Ranger21 core: PNM uses the current and pre-update momentum in-place; AMSGrad uses max(v).
+// DenseMatrix CUDA allocations are at least float4-aligned.  This only groups four
+// independent scalar updates per thread; per-element arithmetic and state semantics stay unchanged.
+BULLET_KERNEL Ranger21Kernel(
+    const int size,
+    const float beta0,
+    const float beta1_sq,
+    const float beta2,
+    const float adj,
+    const float step_size,
+    const float inv_sqrt_bias_correction2,
+    const float eps,
+    const float decay,
+    const float min_weight,
+    const float max_weight,
+    const bool clamp_weights,
+    float* network,
+    float* momentum,
+    float* velocity,
+    float* max_velocity,
+    const float* gradients)
+{
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid < size / 4)
+    {
+        float4 p = ((float4 *)network)[tid];
+        float4 m = ((float4 *)momentum)[tid];
+        float4 v = ((float4 *)velocity)[tid];
+        float4 mv = ((float4 *)max_velocity)[tid];
+        const float4 g = ((const float4 *)gradients)[tid];
+
+#define RANGER21_UPDATE(component)                                                    \
+        {                                                                              \
+            float value = p.component * decay;                                        \
+            const float grad = adj * g.component;                                     \
+            const float old_momentum = m.component;                                   \
+            const float new_momentum = beta1_sq * old_momentum                        \
+                + (1.0F - beta1_sq) * grad;                                           \
+            m.component = new_momentum;                                                \
+            const float new_velocity = beta2 * v.component                            \
+                + (1.0F - beta2) * grad * grad;                                       \
+            v.component = new_velocity;                                                \
+            const float new_max_velocity = max(mv.component, new_velocity);           \
+            mv.component = new_max_velocity;                                           \
+            const float pnm = (1.0F + beta0) * new_momentum - beta0 * old_momentum;   \
+            const float denom = sqrt(new_max_velocity) * inv_sqrt_bias_correction2     \
+                + eps;                                                                  \
+            value -= step_size * pnm / denom;                                          \
+            if (clamp_weights) value = min(max(value, min_weight), max_weight);        \
+            p.component = value;                                                        \
+        }
+        RANGER21_UPDATE(x)
+        RANGER21_UPDATE(y)
+        RANGER21_UPDATE(z)
+        RANGER21_UPDATE(w)
+#undef RANGER21_UPDATE
+
+        ((float4 *)network)[tid] = p;
+        ((float4 *)momentum)[tid] = m;
+        ((float4 *)velocity)[tid] = v;
+        ((float4 *)max_velocity)[tid] = mv;
+    }
+    else if (4 * tid < size)
+    {
+        for (int i = 0; i < size - 4 * tid; i++)
+        {
+            const int j = 4 * tid + i;
+            float value = network[j] * decay;
+            const float grad = adj * gradients[j];
+            const float old_momentum = momentum[j];
+            const float new_momentum = beta1_sq * old_momentum + (1.0F - beta1_sq) * grad;
+            momentum[j] = new_momentum;
+            const float new_velocity = beta2 * velocity[j] + (1.0F - beta2) * grad * grad;
+            velocity[j] = new_velocity;
+            const float new_max_velocity = max(max_velocity[j], new_velocity);
+            max_velocity[j] = new_max_velocity;
+            const float pnm = (1.0F + beta0) * new_momentum - beta0 * old_momentum;
+            const float denom = sqrt(new_max_velocity) * inv_sqrt_bias_correction2 + eps;
+            value -= step_size * pnm / denom;
+            if (clamp_weights) value = min(max(value, min_weight), max_weight);
+            network[j] = value;
+        }
+    }
+}
 BULLET_KERNEL ClipKernel(const int size, float* params, const float min_weight, const float max_weight) {
     const int tid = blockIdx.x * blockDim.x + threadIdx.x;
 
@@ -289,27 +509,6 @@ BULLET_KERNEL ClipKernel(const int size, float* params, const float min_weight, 
             const int j = 4 * tid + i;
             params[j] = min(max(params[j], min_weight), max_weight);
         }
-    }
-}
-
-BULLET_KERNEL ClipWithRepeatedOffsetKernel(
-    const int rows,
-    const int cols,
-    float* params,
-    const float* offset,
-    const int offset_rows,
-    const int offset_cols,
-    const float min_weight,
-    const float max_weight) {
-    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    const int size = rows * cols;
-
-    if (tid < size)
-    {
-        const int row = tid % rows;
-        const int col = tid / rows;
-        const float shared = offset[(col % offset_cols) * offset_rows + (row % offset_rows)];
-        params[tid] = min(max(params[tid] + shared, min_weight), max_weight) - shared;
     }
 }
 
@@ -532,6 +731,54 @@ BULLET_KERNEL select_backprop(
     }
 }
 
+// Softmax backward (accumulate, 1 block = 1 sample):
+// input_grad[i] += y[i] * (output_grad[i] - ﾎ｣_j y[j] * output_grad[j])
+BULLET_KERNEL SoftmaxBackwardKernel(
+    const int feature_size,
+    const float* softmax_out,
+    const float* output_grad,
+    float* input_grad)
+{
+    const int sample = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int stride = blockDim.x;
+
+    const float* ys = softmax_out + sample * feature_size;
+    const float* gs = output_grad + sample * feature_size;
+    float* igs = input_grad + sample * feature_size;
+
+    __shared__ float swarp[32];
+    __shared__ float sdot[1];
+
+    float local = 0.0F;
+    for (int i = tid; i < feature_size; i += stride) {
+        local += ys[i] * gs[i];
+    }
+
+    for (int off = 16; off > 0; off /= 2) {
+        local += __shfl_down_sync(0xffffffff, local, off);
+    }
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    if (lane == 0) swarp[warp] = local;
+    __syncthreads();
+
+    if (tid < 32) {
+        const int n_warps = (stride + 31) / 32;
+        float r = (tid < n_warps) ? swarp[tid] : 0.0F;
+        for (int off = 16; off > 0; off /= 2) {
+            r += __shfl_down_sync(0xffffffff, r, off);
+        }
+        if (tid == 0) sdot[0] = r;
+    }
+    __syncthreads();
+
+    const float dot = sdot[0];
+    for (int i = tid; i < feature_size; i += stride) {
+        igs[i] += ys[i] * (gs[i] - dot);
+    }
+}
+
 // it is assumed that we will only be using this on matrixs with small number of columns
 // (so the perf won't be terrible)
 BULLET_KERNEL softmax(const int rows, const int cols, const float* input, float* output)
@@ -608,6 +855,285 @@ BULLET_KERNEL sparse_to_dense(const int rows, const int cols, const int max_acti
     }
 }
 
+// Phase 2 (IV譯・ mixed precision 逕ｨ: sparse 竊・BufferF16 逶ｴ謗･蜃ｺ蜉・
+// 譌｢蟄・sparse_to_dense 縺ｨ蜷檎ｭ牙虚菴懊・outputs 繧・__half 縺ｫ縺励※ 1.0 繧・__half 縺ｨ縺励※譖ｸ縺崎ｾｼ繧縲・
+// active 縺ｪ驛ｨ蛻・↓縺ｮ縺ｿ譖ｸ縺崎ｾｼ繧縺ｮ縺ｧ縲・蜻ｼ蜃ｺ蛛ｴ縺ｧ莠句燕縺ｫ 0 fill (cudaMemsetAsync) 縺吶ｋ蜑肴署縲・
+BULLET_KERNEL sparse_to_dense_f16(const int rows, const int cols, const int max_active, const int* inputs, __half* outputs)
+{
+    const int elem = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (elem >= cols)
+        return;
+
+    const int* thisInput = inputs + max_active * elem;
+    __half* thisOutput = outputs + rows * elem;
+    const __half one_half = __float2half(1.0F);
+
+    for (int i = 0; i < max_active; i++) {
+        const int inp = thisInput[i];
+
+        if (inp == -1)
+            break;
+
+        thisOutput[inp] = one_half;
+    }
+}
+
+// Phase 2 Step 3: elementwise SiLU on BufferF16 (in-place / out-of-place 荳｡蟇ｾ蠢・
+// 蜀・Κ compute 縺ｯ f32 縺ｧ陦後＞縲・邨先棡繧・f16 縺ｫ cast 縺礼峩縺・(邊ｾ蠎ｦ遒ｺ菫・縲・
+BULLET_KERNEL silu_f16(const int size, const __half* in, __half* out)
+{
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size)
+        return;
+    const float x = __half2float(in[idx]);
+    const float sig = 1.0F / (1.0F + expf(-x));
+    out[idx] = __float2half(x * sig);
+}
+
+// Phase 2 Step 3: elementwise add + SiLU on BufferF16 (residual + activation 逕ｨ)
+// out = SiLU(a + b)
+BULLET_KERNEL add_silu_f16(const int size, const __half* a, const __half* b, __half* out)
+{
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size)
+        return;
+    const float x = __half2float(a[idx]) + __half2float(b[idx]);
+    const float sig = 1.0F / (1.0F + expf(-x));
+    out[idx] = __float2half(x * sig);
+}
+
+// Phase 2 Step 4: dtype cast kernel (f16 竊・f32)
+// IV譯・縺ｧ activation 繧・f16縲・weight/grad master 繧・f32 縺ｨ縺吶ｋ蠅・阜縺ｧ菴ｿ縺・・
+// in-place 荳榊庄 (input/output 縺ｯ蛻･ buffer 蠢・・縲・
+
+// f16 竊・f32 cast (forward 豢ｻ諤ｧ蛹悶ｒ grad 險育ｮ礼畑 f32 path 縺ｫ貂｡縺呎凾)
+BULLET_KERNEL cast_f16_to_f32(const int size, const __half* in, float* out)
+{
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size)
+        return;
+    out[idx] = __half2float(in[idx]);
+}
+
+// f32 竊・f16 cast (weight master 繧・forward 逕ｨ f16 activation/weight buffer 縺ｫ cast 縺吶ｋ譎・
+BULLET_KERNEL cast_f32_to_f16(const int size, const float* in, __half* out)
+{
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size)
+        return;
+    out[idx] = __float2half(in[idx]);
+}
+
+// Phase 2 Step backward: SiLU 蠕ｮ蛻・(f16 in縲・f16 grad out)
+// silu'(x) = sigmoid(x) * (1 + x * (1 - sigmoid(x)))
+// out[i] = silu'(x[i]) * upstream[i]
+BULLET_KERNEL silu_grad_f16(const int size, const __half* x, const __half* upstream, __half* out)
+{
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size)
+        return;
+    const float xf = __half2float(x[idx]);
+    const float sig = 1.0F / (1.0F + expf(-xf));
+    const float silu_prime = sig * (1.0F + xf * (1.0F - sig));
+    out[idx] = __float2half(silu_prime * __half2float(upstream[idx]));
+}
+
+// Phase 2 backward smoke 逕ｨ: f32 SGD update (master weight 逶ｴ謗･譖ｴ譁ｰ)
+// w -= lr * grad
+BULLET_KERNEL sgd_update_f32(const int size, const float lr, const float* grad, float* w)
+{
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size)
+        return;
+    w[idx] -= lr * grad[idx];
+}
+
+// Phase 2 Step CRCL: im2col (NCHW f32 input 竊・f16 col buffer)
+// 譌｢蟄・Im2ColI8NCHW (inference INT8) 縺九ｉ quantize 繧帝勁縺・◆ f16 迚医・
+// col layout: col[col_idx * CinKK + rest]  (col_idx = N*Hout*Wout 縺ｮ 1 蛻励・rest = Cin*K*K 縺ｮ row)
+BULLET_KERNEL im2col_f16_nchw(
+    int N, int Cin, int H, int W, int Hout, int Wout,
+    int K, int Pad, int Stride,
+    const float* __restrict__ x,
+    __half* __restrict__ col)
+{
+    int col_idx = blockIdx.x;
+    int rest = blockIdx.y * blockDim.x + threadIdx.x;
+    int CinKK = Cin * K * K;
+    int whw = Hout * Wout;
+    if (col_idx >= N * whw || rest >= CinKK) return;
+
+    int wo = col_idx % Wout;
+    int ho = (col_idx / Wout) % Hout;
+    int n = col_idx / whw;
+    int ci = rest / (K * K);
+    int kh = (rest / K) % K;
+    int kw = rest % K;
+    int hi = ho * Stride + kh - Pad;
+    int wi = wo * Stride + kw - Pad;
+
+    float v = 0.0f;
+    if (hi >= 0 && hi < H && wi >= 0 && wi < W) {
+        v = x[((n * Cin + ci) * H + hi) * W + wi];
+    }
+    col[(long)col_idx * CinKK + rest] = __float2half(v);
+}
+
+// Phase 2 Step CRCL backward: col2im (f16 col grad 竊・f32 NCHW input grad縲・accumulate)
+// im2col 縺ｮ騾・婿蜷代・1 input pixel 縺瑚､・焚 conv 菴咲ｽｮ縺ｫ contribute 縺吶ｋ蝣ｴ蜷医・atomic add 縺ｧ accumulate縲・
+// col layout: col[col_idx * CinKK + rest]  (col_idx 竏・[0, N*HW)縲・rest 竏・[0, CinKK))
+// input_grad NCHW: dX[(n*Cin + ci) * H + hi) * W + wi]  (overwrite accumulate 縺輔ｌ繧九◆繧∽ｺ句燕縺ｫ 0 fill 蜑肴署)
+BULLET_KERNEL col2im_f16_to_f32_nchw(
+    int N, int Cin, int H, int W, int Hout, int Wout,
+    int K, int Pad, int Stride,
+    const __half* __restrict__ col,
+    float* __restrict__ dx)
+{
+    int col_idx = blockIdx.x;
+    int rest = blockIdx.y * blockDim.x + threadIdx.x;
+    int CinKK = Cin * K * K;
+    int whw = Hout * Wout;
+    if (col_idx >= N * whw || rest >= CinKK) return;
+
+    int wo = col_idx % Wout;
+    int ho = (col_idx / Wout) % Hout;
+    int n = col_idx / whw;
+    int ci = rest / (K * K);
+    int kh = (rest / K) % K;
+    int kw = rest % K;
+    int hi = ho * Stride + kh - Pad;
+    int wi = wo * Stride + kw - Pad;
+
+    if (hi < 0 || hi >= H || wi < 0 || wi >= W) return;
+
+    float v = __half2float(col[(long)col_idx * CinKK + rest]);
+    atomicAdd(&dx[((n * Cin + ci) * H + hi) * W + wi], v);
+}
+
+// Phase 2 Step CRCL backward: f16 col grad output 逕ｨ縺ｮ zero fill (col2im 蜑肴ｺ門ｙ縲・dx 縺ｮ 0 fill)
+// 蟆ら畑 kernel 荳崎ｦ√・cudaMemsetAsync 縺ｧ 0 fill 縺吶ｌ縺ｰ濶ｯ縺・
+
+// CRCL-v2 謾ｹ蝟・A (SEBlock): global average pool (NCHW 竊・NC11)
+// 1 block 蜀・1 channel 縺ｮ H*W 繧・blockReduce 縺ｧ蟷ｳ蝮・喧縲・1 thread block 縺ｧ 1 (N, C) 繧貞・逅・・
+// grid: (N*C, 1, 1)縲・block: (tpb, 1, 1)
+// shared mem: tpb * sizeof(float)
+BULLET_KERNEL global_avg_pool_f32(int N, int C, int H, int W, const float* __restrict__ x, float* __restrict__ out)
+{
+    extern __shared__ float sbuf[];
+    int nc = blockIdx.x;
+    if (nc >= N * C) return;
+    int tid = threadIdx.x;
+    int hw = H * W;
+    int base = nc * hw;
+    float acc = 0.0f;
+    for (int i = tid; i < hw; i += blockDim.x) {
+        acc += x[base + i];
+    }
+    sbuf[tid] = acc;
+    __syncthreads();
+    // simple tree reduction
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) sbuf[tid] += sbuf[tid + s];
+        __syncthreads();
+    }
+    if (tid == 0) {
+        out[nc] = sbuf[0] / (float)hw;
+    }
+}
+
+// CRCL-v2 謾ｹ蝟・A (SEBlock) backward: global avg pool 縺ｮ grad (NC11 竊・NCHW)
+// 蜷・(n, c) 1 蛟､縺ｮ grad 繧・H*W 蜈ｨ cell 縺ｫ蝮・ｭ牙・驟・(1/HW)
+BULLET_KERNEL global_avg_pool_f32_backward(int N, int C, int H, int W, const float* __restrict__ d_out, float* __restrict__ d_in)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = N * C * H * W;
+    if (idx >= total) return;
+    int hw = H * W;
+    int nc = idx / hw;
+    d_in[idx] = d_out[nc] / (float)hw;
+}
+
+// CRCL-v2 謾ｹ蝟・A (SEBlock): channel-wise multiply (NCHW * NC11 broadcast 竊・NCHW)
+// out[n, c, h, w] = x[n, c, h, w] * s[n, c]
+BULLET_KERNEL channel_wise_mul_f32(int N, int C, int H, int W, const float* __restrict__ x, const float* __restrict__ s, float* __restrict__ out)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = N * C * H * W;
+    if (idx >= total) return;
+    int hw = H * W;
+    int nc = idx / hw;
+    out[idx] = x[idx] * s[nc];
+}
+
+// CRCL-v2 謾ｹ蝟・A (SEBlock) backward: channel-wise mul 縺ｮ grad
+// dx[n, c, h, w] = ds_grad_inputs[n, c, h, w] * s[n, c]      (input x 縺ｸ縺ｮ grad)
+// ds[n, c] = sum_h_w (dy[n, c, h, w] * x[n, c, h, w])       (scale s 縺ｸ縺ｮ grad縲・atomic add)
+// 2 kernel 縺ｫ蛻・牡 (atomic add 縺ｧ accumulate)
+BULLET_KERNEL channel_wise_mul_f32_backward_x(int N, int C, int H, int W, const float* __restrict__ d_out, const float* __restrict__ s, float* __restrict__ dx)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = N * C * H * W;
+    if (idx >= total) return;
+    int hw = H * W;
+    int nc = idx / hw;
+    dx[idx] = d_out[idx] * s[nc];
+}
+
+BULLET_KERNEL channel_wise_mul_f32_backward_s(int N, int C, int H, int W, const float* __restrict__ d_out, const float* __restrict__ x, float* __restrict__ ds)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = N * C * H * W;
+    if (idx >= total) return;
+    int hw = H * W;
+    int nc = idx / hw;
+    atomicAdd(&ds[nc], d_out[idx] * x[idx]);
+}
+
+// Phase 2 Step CRCL: gemm_out_f16 layout (Cout ﾃ・NHW col-major) 竊・NHW ﾃ・Cout col-major 縺ｸ縺ｮ transpose
+// HGEMM 縺ｮ dY (N ﾃ・Cout ﾃ・Hout ﾃ・Wout NCHW) 繧・gemm 蜈･蜉・(Cout ﾃ・NHW col-major) 縺ｫ螟画鋤縺吶ｋ騾・permute
+// (forward 縺ｮ permute 縺ｮ騾・桃菴・
+BULLET_KERNEL permute_nchw_f32_to_gemm_in_f16(
+    int N, int Cout, int Hout, int Wout,
+    const float* __restrict__ dy_nchw,
+    __half* __restrict__ gemm_in)
+{
+    const int co = blockIdx.x * blockDim.x + threadIdx.x;
+    const int col = blockIdx.y * blockDim.y + threadIdx.y;
+    int whw = Hout * Wout;
+    int nhw = N * whw;
+    if (co >= Cout || col >= nhw) return;
+
+    int wo = col % Wout;
+    int ho = (col / Wout) % Hout;
+    int n = col / whw;
+    long src_idx = ((long)(n * Cout + co) * Hout + ho) * Wout + wo;
+    long dst_idx = (long)col * Cout + co;
+    gemm_in[dst_idx] = __float2half(dy_nchw[src_idx]);
+}
+
+// Phase 2 Step CRCL: permute (Cout ﾃ・NHW f16 GEMM 邨先棡) 竊・NCHW f32 output
+// HGEMM 縺ｮ natural layout (col-major Cout, row-major NHW) 繧・NCHW f32 縺ｫ螟画鋤縺吶ｋ fused kernel
+BULLET_KERNEL permute_gemm_out_f16_to_f32_nchw(
+    int N, int Cout, int Hout, int Wout,
+    const __half* __restrict__ gemm_out,
+    float* __restrict__ output)
+{
+    const int co = blockIdx.x * blockDim.x + threadIdx.x;
+    const int col = blockIdx.y * blockDim.y + threadIdx.y;
+    int whw = Hout * Wout;
+    int nhw = N * whw;
+    if (co >= Cout || col >= nhw) return;
+
+    long gidx = (long)col * Cout + co;
+    float v = __half2float(gemm_out[gidx]);
+    int wo = col % Wout;
+    int ho = (col / Wout) % Hout;
+    int n = col / whw;
+    long oidx = ((long)(n * Cout + co) * Hout + ho) * Wout + wo;
+    output[oidx] = v;
+}
+
 BULLET_KERNEL LinearCombStridedKernel(
     const int increment,
     const int rows,
@@ -633,5 +1159,170 @@ BULLET_KERNEL LinearCombStridedKernel(
     else
     {
         this_out[0] = input[col * input_stride + row];
+    }
+}
+
+// ===== gather affine (2026-11-14 OPNARCH T2): 選んだ bucket の行だけを計算する affine =====
+// W は列優先 [rows = NB * O, I] (W[r, k] = W[k * rows + r])、 bias [rows]、 x [B, I]、 y / dy [B, O]、 buckets [B]。
+// 範囲外の bucket (< 0 または >= NB) の局面は何も計算しない (出力 0 / 勾配 0)。
+// どの kernel も block = 256 threads (8 warps) 固定で起動する (Rust 側 device.rs と一致させること)。
+// 加算の順序は固定 (atomic を使わない) なので、 同じ入力なら毎回 bit 単位で同じ結果になる。
+
+// 順伝播。 grid = (B), shared = 8 * O floats。 warp w が k = w, w+8, ... を受け持ち、 lane が j を受け持つ
+// (W の読みは j 方向に連続 = coalesced)。 最後に 8 warp の部分和を足して bias を加える。
+BULLET_KERNEL bucketed_affine_fwd(
+    const int batch_size,
+    const int input_size,
+    const int output_size,
+    const int num_buckets,
+    const float* __restrict__ weights,
+    const float* __restrict__ bias,
+    const float* __restrict__ input,
+    const int* __restrict__ buckets,
+    float* __restrict__ output)
+{
+    extern __shared__ float sbuf[];
+    const int b = blockIdx.x;
+    if (b >= batch_size) return;
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int bk = buckets[b];
+    float* out = output + (size_t)b * output_size;
+    if (bk < 0 || bk >= num_buckets) {
+        for (int j = threadIdx.x; j < output_size; j += blockDim.x) out[j] = 0.0F;
+        return;
+    }
+    const size_t rows = (size_t)num_buckets * output_size;
+    const size_t base = (size_t)bk * output_size;
+    const float* x = input + (size_t)b * input_size;
+    for (int j = lane; j < output_size; j += 32) {
+        float acc = 0.0F;
+        for (int k = warp; k < input_size; k += 8) acc += weights[(size_t)k * rows + base + j] * x[k];
+        sbuf[warp * output_size + j] = acc;
+    }
+    __syncthreads();
+    for (int j = threadIdx.x; j < output_size; j += blockDim.x) {
+        float acc = bias[base + j];
+        for (int w = 0; w < 8; w++) acc += sbuf[w * output_size + j];
+        out[j] = acc;
+    }
+}
+
+// 入力の勾配 (加算)。 grid = (B), shared = O floats (dy の行)。 warp w が k = w, w+8, ... を受け持ち、
+// lane で j を分けて warp 内で足し合わせる。
+BULLET_KERNEL bucketed_affine_bwd_input(
+    const int batch_size,
+    const int input_size,
+    const int output_size,
+    const int num_buckets,
+    const float* __restrict__ weights,
+    const int* __restrict__ buckets,
+    const float* __restrict__ output_grad,
+    float* __restrict__ input_grad)
+{
+    extern __shared__ float sbuf[];
+    const int b = blockIdx.x;
+    if (b >= batch_size) return;
+    const int bk = buckets[b];
+    if (bk < 0 || bk >= num_buckets) return;
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const size_t rows = (size_t)num_buckets * output_size;
+    const size_t base = (size_t)bk * output_size;
+    for (int j = threadIdx.x; j < output_size; j += blockDim.x) sbuf[j] = output_grad[(size_t)b * output_size + j];
+    __syncthreads();
+    float* dx = input_grad + (size_t)b * input_size;
+    for (int k = warp; k < input_size; k += 8) {
+        float acc = 0.0F;
+        for (int j = lane; j < output_size; j += 32) acc += weights[(size_t)k * rows + base + j] * sbuf[j];
+        for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffff, acc, off);
+        if (lane == 0) dx[k] += acc;
+    }
+}
+
+// block (256 threads) で buckets[0..B) を走査し、 buckets[i] == bk の i を**昇順に** list (共有メモリ) へ詰める。
+// 返り値 = 個数。 全 thread が呼ぶこと (__ballot_sync / __syncthreads を含む)。 cnt は共有メモリ 9 個。
+__device__ int bucketed_collect(const int batch_size, const int* __restrict__ buckets, const int bk, int* list, int* cnt)
+{
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    if (threadIdx.x == 0) cnt[8] = 0;
+    __syncthreads();
+    for (int c = 0; c < batch_size; c += 256) {
+        const int i = c + threadIdx.x;
+        const bool hit = i < batch_size && buckets[i] == bk;
+        const unsigned mask = __ballot_sync(0xffffffff, hit);
+        if (lane == 0) cnt[warp] = __popc(mask);
+        __syncthreads();
+        int off = cnt[8];
+        for (int w = 0; w < warp; w++) off += cnt[w];
+        if (hit) list[off + __popc(mask & ((1u << lane) - 1u))] = i;
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            int s = cnt[8];
+            for (int w = 0; w < 8; w++) s += cnt[w];
+            cnt[8] = s;
+        }
+        __syncthreads();
+    }
+    return cnt[8];
+}
+
+// 重みの勾配 (加算)。 grid = (NB, ceil(I / kc)), shared = B ints (局面の一覧)。
+// block (bk, kt) が W の行 bk*O .. bk*O+O-1、 列 kt*kc .. の O * kc 要素を受け持ち、
+// その bucket の局面だけを昇順に足す (atomic なし)。
+BULLET_KERNEL bucketed_affine_bwd_weights(
+    const int batch_size,
+    const int input_size,
+    const int output_size,
+    const int num_buckets,
+    const int kc,
+    const float* __restrict__ input,
+    const int* __restrict__ buckets,
+    const float* __restrict__ output_grad,
+    float* __restrict__ weights_grad)
+{
+    extern __shared__ float sbuf[];
+    __shared__ int cnt[9];
+    int* list = (int*)sbuf;
+    const int bk = blockIdx.x;
+    const int n = bucketed_collect(batch_size, buckets, bk, list, cnt);
+    if (n == 0) return;
+    const size_t rows = (size_t)num_buckets * output_size;
+    const size_t base = (size_t)bk * output_size;
+    const int k0 = blockIdx.y * kc;
+    const int total = output_size * kc;
+    for (int idx = threadIdx.x; idx < total; idx += blockDim.x) {
+        const int j = idx % output_size;
+        const int k = k0 + idx / output_size;
+        if (k >= input_size) continue;
+        float acc = 0.0F;
+        for (int s = 0; s < n; s++) {
+            const int b = list[s];
+            acc += output_grad[(size_t)b * output_size + j] * input[(size_t)b * input_size + k];
+        }
+        weights_grad[(size_t)k * rows + base + j] += acc;
+    }
+}
+
+// bias の勾配 (加算)。 grid = (NB), shared = B ints。
+BULLET_KERNEL bucketed_affine_bwd_bias(
+    const int batch_size,
+    const int output_size,
+    const int num_buckets,
+    const int* __restrict__ buckets,
+    const float* __restrict__ output_grad,
+    float* __restrict__ bias_grad)
+{
+    extern __shared__ float sbuf[];
+    __shared__ int cnt[9];
+    int* list = (int*)sbuf;
+    const int bk = blockIdx.x;
+    const int n = bucketed_collect(batch_size, buckets, bk, list, cnt);
+    if (n == 0 || bk >= num_buckets) return;
+    for (int j = threadIdx.x; j < output_size; j += blockDim.x) {
+        float acc = 0.0F;
+        for (int s = 0; s < n; s++) acc += output_grad[(size_t)list[s] * output_size + j];
+        bias_grad[(size_t)bk * output_size + j] += acc;
     }
 }

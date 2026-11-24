@@ -1,6 +1,9 @@
 use std::{collections::HashMap, sync::Arc};
 
-use crate::device::{Device, OperationError, tensor::DenseMatrix};
+use crate::{
+    device::{Device, OperationError, tensor::DenseMatrix},
+    graph::CheckpointShapeAdapter,
+};
 
 use super::{OptimiserState, utils::Placement};
 
@@ -69,9 +72,10 @@ impl<D: Device, S: OptimiserState<D>> OptimiserState<D> for WeightDecay<S> {
         map: &mut HashMap<String, &mut Self>,
         path: &str,
         old_format: bool,
+        adapter: &dyn CheckpointShapeAdapter,
     ) -> Result<(), OperationError<D::DeviceError>> {
         let mut map = map.iter_mut().map(|(id, single)| (id.clone(), &mut single.inner)).collect();
-        S::load_from_checkpoint(&mut map, path, old_format)
+        S::load_from_checkpoint(&mut map, path, old_format, adapter)
     }
 
     fn write_to_checkpoint(map: &HashMap<String, &Self>, path: &str) -> Result<(), D::DeviceError> {

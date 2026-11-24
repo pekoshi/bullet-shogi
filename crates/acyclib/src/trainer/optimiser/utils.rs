@@ -1,12 +1,38 @@
-use crate::device::{
-    Device,
-    tensor::{DenseMatrix, read_from_byte_buffer},
+use std::borrow::Cow;
+
+use crate::{
+    device::{
+        Device, OperationError,
+        tensor::{DenseMatrix, read_from_byte_buffer},
+    },
+    graph::CheckpointShapeAdapter,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Placement {
     Before,
     After,
+}
+
+/// checkpoint のバッファ `values` を graph 側の要素数 `expected` に合わせる。
+///
+/// 要素数が一致していればそのまま借用で返し、 不一致なら `adapter` で変換する。
+/// 変換できない (= `None`) 場合は size mismatch エラーを返す。 optimiser state
+/// (momentum / velocity / slow など) のロードで weights.bin と同じ変換を適用するために使う。
+pub fn adapt_to_size<'a, D: Device>(
+    adapter: &dyn CheckpointShapeAdapter,
+    id: &str,
+    values: &'a [f32],
+    expected: usize,
+) -> Result<Cow<'a, [f32]>, OperationError<D::DeviceError>> {
+    if values.len() == expected {
+        return Ok(Cow::Borrowed(values));
+    }
+    match adapter.adapt(id, values, expected) {
+        Some(adapted) if adapted.len() == expected => Ok(Cow::Owned(adapted)),
+        Some(adapted) => Err(OperationError::WeightLoadingError(id.to_string(), Some((adapted.len(), expected)))),
+        None => Err(OperationError::WeightLoadingError(id.to_string(), Some((values.len(), expected)))),
+    }
 }
 
 /// Write a set of labelled weights from a `HashMap` into a file.

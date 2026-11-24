@@ -47,8 +47,70 @@ impl<A: SparseInputType, B: Factorises<A>> SparseInputType for Factorised<A, B> 
         });
     }
 
+    /// 非対称 emission (aux 連結入力等) を factorise 対応で転送する。
+    ///
+    /// inner の `map_features_split` が emit する各特徴を `offset` だけずらして
+    /// 実特徴として emit し、 `derive_feature` が `Some` を返す特徴 (= HalfKA 部)
+    /// にのみ factor virtual feature を追加 emit する。 aux 特徴 (= king 非依存の
+    /// 生特徴) は `derive_feature` が `None` を返すため factor は付かない。
+    ///
+    /// 対称な inner (default `map_features_split` = `map_features` 経由) では
+    /// emit 順・値とも従来の `map_features` 経路と完全一致する (= 既存 factorise
+    /// 構成と bit-identical)。
+    fn map_features_split<F: FnMut(Option<usize>, Option<usize>)>(&self, pos: &Self::RequiredDataType, mut f: F) {
+        self.normal.map_features_split(pos, |stm, ntm| {
+            f(stm.map(|v| self.offset + v), ntm.map(|v| self.offset + v));
+
+            let stm_fac = stm.and_then(|v| self.factoriser.derive_feature(&self.normal, v));
+            let ntm_fac = ntm.and_then(|v| self.factoriser.derive_feature(&self.normal, v));
+
+            if let Some(v) = stm_fac {
+                assert!(v < self.offset, "Factoriser feature exceeded factoriser size!");
+            }
+            if let Some(v) = ntm_fac {
+                assert!(v < self.offset, "Factoriser feature exceeded factoriser size!");
+            }
+            if stm_fac.is_some() || ntm_fac.is_some() {
+                f(stm_fac, ntm_fac);
+            }
+        });
+    }
+
     fn shorthand(&self) -> String {
         self.normal.shorthand()
+    }
+
+    // ------------------------------------------------------------------
+    // 補助入力 (dense / sparse) の転送
+    //
+    // factoriser は main sparse 入力 (FT) だけを仮想特徴で拡張するもので、
+    // aux dense (hand_count / pin) や aux sparse (Dual PSQT / PairShape /
+    // KingDanger 等の head 入力) は別チャネルなので、 そのまま inner へ
+    // delegate すれば良い。 これにより --factorise と各 head の併用が可能になる。
+    // ------------------------------------------------------------------
+
+    fn hand_count_dims(&self) -> Option<usize> {
+        self.normal.hand_count_dims()
+    }
+
+    fn fill_hand_count(&self, pos: &Self::RequiredDataType, out: &mut [f32]) {
+        self.normal.fill_hand_count(pos, out);
+    }
+
+    fn auxiliary_dense_dims(&self) -> Vec<(String, usize)> {
+        self.normal.auxiliary_dense_dims()
+    }
+
+    fn fill_auxiliary_dense(&self, name: &str, pos: &Self::RequiredDataType, out: &mut [f32]) {
+        self.normal.fill_auxiliary_dense(name, pos, out);
+    }
+
+    fn auxiliary_sparse_dims(&self) -> Vec<(String, usize, usize)> {
+        self.normal.auxiliary_sparse_dims()
+    }
+
+    fn fill_auxiliary_sparse(&self, name: &str, pos: &Self::RequiredDataType, out: &mut [i32]) -> usize {
+        self.normal.fill_auxiliary_sparse(name, pos, out)
     }
 
     fn description(&self) -> String {

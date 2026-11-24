@@ -14,12 +14,13 @@ use crate::{
             node::AnnotatedNode,
             operation::{
                 GraphIROperationCompilable,
-                affine::Matmul,
+                affine::{Matmul, MatmulF16Mixed},
                 binary::{Concat, Select, SoftmaxCrossEntropy},
                 nary::LinearCombination,
                 sparse::SparseAffineActivate,
                 unary::{
-                    ClipPassThroughGrad, Copy, FauxQuantise, PairwiseMul, ReduceAcrossBatch, Slice, ToDense, Unary,
+                    ClipPassThroughGrad, Copy, FauxQuantise, PairwiseMul, ReduceAcrossBatch, RmsNorm, Slice, Softmax,
+                    ToDense, Unary, UnaryF16Mixed,
                 },
             },
         },
@@ -138,6 +139,13 @@ where
         }
     }
 
+    /// Phase 2 IV案: mixed precision matmul (中間 f16 buffer + HGEMM 経由)。
+    /// 当面 NobBat (weight × batched input) のみ対応、 backward は placeholder。
+    /// Tensor Core (T4 等 sm_70+) で速度向上、 1050 Ti でも crash なし。
+    pub fn matmul_mixed(self, rhs: Self) -> Self {
+        self.builder.apply(MatmulF16Mixed { a: self.node, transa: false, b: rhs.node, transb: false })
+    }
+
     pub fn repeat(self, n: usize) -> Self {
         let shape = self.node.shape;
         let ones = self.builder.new_constant(Shape::new(1, n), &vec![1.0; n]);
@@ -165,13 +173,27 @@ where
     }
 }
 
-impl<B: BackendMarker> GraphBuilderNode<'_, B> {
+impl<'a, B: BackendMarker> GraphBuilderNode<'a, B> {
     pub fn annotated_node(&self) -> AnnotatedNode {
         self.node
     }
 
     pub fn node(self) -> Node {
         self.node.into()
+    }
+
+    /// Access the underlying `GraphBuilder`. Allows external crates (e.g.
+    /// `bullet_cuda_backend`) to define ext traits that apply backend-specific ops
+    /// while still constructing a `GraphBuilderNode` of the same backend.
+    pub fn graph_builder(&self) -> &'a GraphBuilder<B> {
+        self.builder
+    }
+
+    /// Construct a `GraphBuilderNode` from an existing `AnnotatedNode`. Useful for
+    /// ext traits that have manually pushed an operation into the IR and need to
+    /// return a builder-friendly handle.
+    pub fn from_annotated(builder: &'a GraphBuilder<B>, node: AnnotatedNode) -> Self {
+        Self { node, builder }
     }
 
     pub fn reshape(mut self, shape: Shape) -> Self {
@@ -197,6 +219,34 @@ impl<B: BackendMarker> GraphBuilderNode<'_, B> {
 
     pub fn sigmoid(self) -> Self {
         self.diffable_from_output(DiffableFromOutput::Sigmoid)
+    }
+
+    /// LeakyReLU (slope 0.01): f(x) = max(0.01*x, x)、 dying ReLU 回避
+    pub fn leaky_relu(self) -> Self {
+        self.diffable_from_output(DiffableFromOutput::LeakyReLU)
+    }
+
+    /// SiLU (Swish) 活性化: f(x) = x * sigmoid(x)
+    pub fn silu(self) -> Self {
+        self.builder.apply(Unary { input: self.node, op: UnaryOp::Silu })
+    }
+
+    /// Phase 2 IV案: mixed precision SiLU (中間 f16 buffer 経由)。
+    /// 入出力 Tensor は f32 だが、 forward / backward の中間活性化が f16 になる。
+    /// Tensor Core を使う backend (T4 等 sm_70+) で速度向上を期待、 sm_61 では fallback。
+    pub fn silu_mixed(self) -> Self {
+        self.builder.apply(UnaryF16Mixed { input: self.node, op: UnaryOp::Silu })
+    }
+
+    /// RMSNorm (γ なし版): out[i] = in[i] / sqrt(mean(in^2) + eps)
+    /// feature 軸 (= shape の 1 サンプル分) で reduction する。
+    pub fn rms_norm(self, eps: f32) -> Self {
+        self.builder.apply(RmsNorm { input: self.node, eps })
+    }
+
+    /// Standalone Softmax (feature 軸 reduction): y[i] = exp(x[i]-max) / Σ exp(x[j]-max)
+    pub fn softmax(self) -> Self {
+        self.builder.apply(Softmax { input: self.node })
     }
 
     /// Clamps the values elementwise into the range [min, max],

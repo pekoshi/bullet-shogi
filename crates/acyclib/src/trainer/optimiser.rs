@@ -1,7 +1,6 @@
 pub mod adam;
 pub mod clip;
 pub mod decay;
-pub mod nnue_clip;
 pub mod radam;
 pub mod ranger;
 pub mod ranger21;
@@ -10,8 +9,8 @@ pub mod utils;
 use std::{collections::HashMap, fmt::Debug, marker::PhantomData, sync::Arc};
 
 use crate::{
-    device::{tensor::DenseMatrix, Device, OperationError},
-    graph::{like::GraphLike, Graph, GraphNodeId, GraphNodeIdTy},
+    device::{Device, OperationError, tensor::DenseMatrix},
+    graph::{CheckpointShapeAdapter, Graph, GraphNodeId, GraphNodeIdTy, NoShapeAdapter, like::GraphLike},
 };
 
 pub trait OptimiserState<D: Device>: Sized {
@@ -29,24 +28,76 @@ pub trait OptimiserState<D: Device>: Sized {
 
     fn reset(&mut self) -> Result<(), D::DeviceError>;
 
+    /// velocity (= 二次モーメント) buffer を指定した正の定数で埋める。
+    ///
+    /// `--resume-from-quantised` のように optimiser state が zero init のまま
+    /// 訓練を再開すると、 Adam/RAdam の更新分母 `sqrt(v) + eps` が `eps`(=1e-8) に
+    /// 退化し、 初手の更新が `lr * grad / 1e-8` で爆発する (= eval 出力 ~10x 崩壊)。
+    /// velocity を小さい正の定数 (例 1e-4) で初期化すると分母が `sqrt(1e-4)=0.01`
+    /// となり爆発を防げる。
+    ///
+    /// velocity を持たない optimiser state では no-op。
+    fn init_velocity(&mut self, _value: f32) -> Result<(), D::DeviceError> {
+        Ok(())
+    }
+
+    /// checkpoint から optimiser state を読み込む。
+    ///
+    /// `adapter` は重みと同形のバッファ (momentum / velocity / slow など) の要素数が
+    /// graph と一致しないときに呼ばれ、 graph 側の形状へ変換する (weights.bin と同じ
+    /// 変換を state にも適用するため)。 変換不要なら [`NoShapeAdapter`] を渡す。
     fn load_from_checkpoint(
         map: &mut HashMap<String, &mut Self>,
         path: &str,
         old_format: bool,
+        adapter: &dyn CheckpointShapeAdapter,
     ) -> Result<(), OperationError<D::DeviceError>>;
+
+    /// **勾配を持たない重み (真の凍結) を許す版**。  2026-11-03
+    ///
+    /// `skip` に入っている id は optimiser 状態を持たないので、 checkpoint の file に
+    /// その id の状態が残っていても **無視する** (panic しない)。
+    /// 既定実装は `skip` を見ずに従来の `load_from_checkpoint` を呼ぶので、
+    /// 上書きしない optimiser の挙動は**完全に不変**。
+    /// 🚨`BULLET_SKIP_UNKNOWN_WEIGHTS=1` で代用しないこと (本物の不一致まで黙る)。
+    fn load_from_checkpoint_with_skip(
+        map: &mut HashMap<String, &mut Self>,
+        path: &str,
+        old_format: bool,
+        adapter: &dyn CheckpointShapeAdapter,
+        _skip: &std::collections::HashSet<String>,
+    ) -> Result<(), OperationError<D::DeviceError>> {
+        Self::load_from_checkpoint(map, path, old_format, adapter)
+    }
 
     fn write_to_checkpoint(map: &HashMap<String, &Self>, path: &str) -> Result<(), D::DeviceError>;
 
     fn set_params(&mut self, params: Self::Params);
+
+    /// 1 本の tensor の中で区間ごとに lr 倍率を変える (`(start, end, 倍率)` の列、 [0, size) を隙間なく覆う)。
+    /// tensor 全体の倍率 (`Optimiser::set_lr_scale`) にさらに掛かる。 対応していない optimiser では panic。
+    fn set_range_lr_scales(&mut self, _ranges: Vec<(usize, usize, f32, f32)>) {
+        panic!("this optimiser does not support per-range lr scales")
+    }
 }
 
 pub struct Optimiser<D: Device, G: GraphLike<D>, S: OptimiserState<D>> {
     phantom: PhantomData<D>,
     pub graph: G,
     pub state: HashMap<String, S>,
-    batch_start_update: Vec<Box<dyn AdditionalUpdate<D>>>,
     pre_update: Vec<Box<dyn AdditionalUpdate<D>>>,
     post_update: Vec<Box<dyn AdditionalUpdate<D>>>,
+    /// Per-tensor learning rate multiplier. 重み id ごとに lr に掛ける倍率を保持する。
+    /// 未登録の id は 1.0 (= 既存挙動) として扱う。
+    /// 注意: Adam/RAdam では `lr` は weight decay 項にも掛かるため、 倍率を大きくすると
+    /// weight decay も同倍率で強化される。 sparse embedding を boost したい場合は
+    /// `set_params_for_weight` で対象 tensor の decay を 0 にしておくこと。
+    lr_scale: HashMap<String, f32>,
+    /// **勾配を持たない重み** (真の凍結) の id。  2026-11-03
+    ///   `requires_grad=false` の leaf は compile が Gradients tensor を作らないので、
+    ///   optimiser 状態を確保しない。 その id をここに覚えておき、 setter と
+    ///   checkpoint の読み込みで panic しないようにする。
+    stateless: std::collections::HashSet<String>,
 }
 
 pub trait AdditionalUpdate<D: Device> {
@@ -59,12 +110,23 @@ impl<D: Device, G: GraphLike<D>, S: OptimiserState<D>> Optimiser<D, G, S> {
 
         let mut state = HashMap::new();
 
+        let mut stateless = std::collections::HashSet::new();
+
         for id in &weight_ids {
             let idx = graph.primary().weight_idx(id).unwrap();
             let w = graph.primary().get(GraphNodeId::new(idx, GraphNodeIdTy::Values)).unwrap();
             let w = w.dense();
             assert!(w.batch_size().is_none());
             let size = w.size();
+
+            // **勾配ノードが無い重みは optimiser 状態を作らない** (真の凍結)。  2026-11-03
+            //   既定の graph では全 weight が requires_grad=true なのでここは発火しない
+            //   = 既存の挙動と bit-exact。
+            if graph.primary().get(GraphNodeId::new(idx, GraphNodeIdTy::Gradients)).is_err() {
+                println!("optimiser: {id} has no gradient node; no optimiser state allocated ({size} params)");
+                stateless.insert(id.clone());
+                continue;
+            }
 
             let single = S::new(graph.primary().device(), size, params.clone())?;
 
@@ -76,22 +138,43 @@ impl<D: Device, G: GraphLike<D>, S: OptimiserState<D>> Optimiser<D, G, S> {
             phantom: PhantomData,
             graph,
             state,
-            batch_start_update: Vec::new(),
+            stateless,
             pre_update: Vec::new(),
             post_update: Vec::new(),
+            lr_scale: HashMap::new(),
         })
     }
 
-    pub fn add_batch_start_update(&mut self, additional: impl AdditionalUpdate<D> + 'static) {
-        self.batch_start_update.push(Box::new(additional));
+    /// 指定 weight id の learning rate を `scale` 倍する。 `scale == 1.0` を指定する (または
+    /// 未呼び出しの) tensor は既存挙動と完全一致。
+    ///
+    /// 用途例: arm 11 KingRing PSQT head のように **sparse 更新で平均的に学習が遅い** tensor を
+    /// boost したい場合。 ただし RAdam の weight decay は `lr` 比例なので、 scale > 1 を入れる
+    /// なら同時に `set_params_for_weight(id, RangerParams { decay: 0.0, .. })` で decay を切ること。
+    pub fn set_lr_scale(&mut self, id: &str, scale: f32) {
+        assert!(scale > 0.0 && scale.is_finite(), "lr_scale must be positive finite, got {scale}");
+        self.lr_scale.insert(id.to_string(), scale);
     }
 
-    pub fn run_batch_start_updates(&mut self) -> Result<(), OperationError<D::DeviceError>> {
-        for additional in &mut self.batch_start_update {
-            additional.apply_update(self.graph.primary_mut())?;
+    /// 指定 weight id の tensor の中で、 区間ごとに lr 倍率を変える (`set_lr_scale` の倍率にさらに掛かる)。
+    /// 例: threat 表を群ごとに 1 本の tensor に連結している場合の群別 lr。
+    pub fn set_range_lr_scales(&mut self, id: &str, ranges: Vec<(usize, usize, f32, f32)>) {
+        // 真の凍結された重みは状態を持たないので、 落とさずに 1 行出して何もしない。
+        if self.stateless.contains(id) {
+            println!("optimiser: set_range_lr_scales({id}) ignored (frozen weight has no state)");
+            return;
         }
+        self.state.get_mut(id).unwrap_or_else(|| panic!("unknown weight id {id}")).set_range_lr_scales(ranges);
+    }
 
-        Ok(())
+    /// 真の凍結された重み (勾配も optimiser 状態も持たない) の id。
+    pub fn stateless_ids(&self) -> &std::collections::HashSet<String> {
+        &self.stateless
+    }
+
+    /// `set_lr_scale` で登録された倍率を返す (未登録は 1.0)。 デバッグ・テスト用。
+    pub fn lr_scale_of(&self, id: &str) -> f32 {
+        self.lr_scale.get(id).copied().unwrap_or(1.0)
     }
 
     pub fn add_pre_update(&mut self, additional: impl AdditionalUpdate<D> + 'static) {
@@ -112,12 +195,14 @@ impl<D: Device, G: GraphLike<D>, S: OptimiserState<D>> Optimiser<D, G, S> {
             let weight_id = GraphNodeId::new(idx, GraphNodeIdTy::Values);
 
             let weights = &mut self.graph.primary().get(weight_id)?;
-            let single = self.state.get_mut(id).unwrap();
-
+            // 🚨state の取得は**勾配の分岐の中**で行う。 真の凍結された重みは state を
+            //   持たないので、 外で unwrap すると落ちる。
             let grad_id = GraphNodeId::new(idx, GraphNodeIdTy::Gradients);
-            if let Ok(grads) = self.graph.primary().get(grad_id) {
+            if let (Ok(grads), Some(single)) = (self.graph.primary().get(grad_id), self.state.get_mut(id)) {
                 self.graph.reduce_sum_into_first(&self.graph.get_all(grad_id)?)?;
-                single.update(&mut *weights.dense_mut(), &mut *grads.dense_mut(), gradient_factor, learning_rate)?;
+                let scale = self.lr_scale.get(id).copied().unwrap_or(1.0);
+                let effective_lr = learning_rate * scale;
+                single.update(&mut *weights.dense_mut(), &mut *grads.dense_mut(), gradient_factor, effective_lr)?;
                 self.graph.scatter_first_into_rest(&self.graph.get_all(weight_id)?)?;
             }
         }
@@ -137,7 +222,22 @@ impl<D: Device, G: GraphLike<D>, S: OptimiserState<D>> Optimiser<D, G, S> {
         Ok(())
     }
 
+    /// 全 weight tensor の velocity buffer を指定した正の定数で初期化する。
+    /// `--resume-from-quantised` の velocity=0 爆発回避用 (詳細は
+    /// `OptimiserState::init_velocity` を参照)。
+    pub fn init_velocity(&mut self, value: f32) -> Result<(), D::DeviceError> {
+        for single in self.state.values_mut() {
+            single.init_velocity(value)?;
+        }
+
+        Ok(())
+    }
+
     pub fn set_params_for_weight(&mut self, id: &str, params: S::Params) {
+        if self.stateless.contains(id) {
+            println!("optimiser: set_params_for_weight({id}) ignored (frozen weight has no state)");
+            return;
+        }
         self.state.get_mut(id).unwrap().set_params(params);
     }
 
@@ -154,23 +254,48 @@ impl<D: Device, G: GraphLike<D>, S: OptimiserState<D>> Optimiser<D, G, S> {
     }
 
     pub fn load_from_checkpoint(&mut self, path: &str) -> Result<(), OperationError<D::DeviceError>> {
-        self.load_from_checkpoint_(path, false)
+        self.load_from_checkpoint_(path, false, &NoShapeAdapter)
+    }
+
+    /// [`Self::load_from_checkpoint`] と同じだが、 要素数が graph と一致しないテンソル
+    /// (重み・optimiser state とも) を `adapter` で graph 側の形状へ変換して読み込む。
+    pub fn load_from_checkpoint_adapted(
+        &mut self,
+        path: &str,
+        adapter: &dyn CheckpointShapeAdapter,
+    ) -> Result<(), OperationError<D::DeviceError>> {
+        self.load_from_checkpoint_(path, false, adapter)
     }
 
     pub fn load_weights_from_file(&mut self, path: &str) -> Result<(), OperationError<D::DeviceError>> {
-        self.load_weights_from_file_(path, false)
+        self.load_weights_from_file_(path, false, &NoShapeAdapter)
+    }
+
+    /// [`Self::load_weights_from_file`] と同じだが、 要素数が graph と一致しない重みを
+    /// `adapter` で graph 側の形状へ変換して読み込む。
+    pub fn load_weights_from_file_adapted(
+        &mut self,
+        path: &str,
+        adapter: &dyn CheckpointShapeAdapter,
+    ) -> Result<(), OperationError<D::DeviceError>> {
+        self.load_weights_from_file_(path, false, adapter)
     }
 
     pub fn load_from_old_format_checkpoint(&mut self, path: &str) -> Result<(), OperationError<D::DeviceError>> {
-        self.load_from_checkpoint_(path, true)
+        self.load_from_checkpoint_(path, true, &NoShapeAdapter)
     }
 
     pub fn load_old_format_weights_from_file(&mut self, path: &str) -> Result<(), OperationError<D::DeviceError>> {
-        self.load_weights_from_file_(path, true)
+        self.load_weights_from_file_(path, true, &NoShapeAdapter)
     }
 
-    fn load_weights_from_file_(&mut self, path: &str, old_format: bool) -> Result<(), OperationError<D::DeviceError>> {
-        self.graph.primary_mut().load_from_file(path, old_format)?;
+    fn load_weights_from_file_(
+        &mut self,
+        path: &str,
+        old_format: bool,
+        adapter: &dyn CheckpointShapeAdapter,
+    ) -> Result<(), OperationError<D::DeviceError>> {
+        self.graph.primary_mut().load_from_file_adapted(path, old_format, adapter)?;
 
         let primary = self.graph.primary();
 
@@ -182,10 +307,15 @@ impl<D: Device, G: GraphLike<D>, S: OptimiserState<D>> Optimiser<D, G, S> {
         Ok(())
     }
 
-    fn load_from_checkpoint_(&mut self, path: &str, old_format: bool) -> Result<(), OperationError<D::DeviceError>> {
-        self.load_weights_from_file_(&format!("{path}/weights.bin"), old_format)?;
+    fn load_from_checkpoint_(
+        &mut self,
+        path: &str,
+        old_format: bool,
+        adapter: &dyn CheckpointShapeAdapter,
+    ) -> Result<(), OperationError<D::DeviceError>> {
+        self.load_weights_from_file_(&format!("{path}/weights.bin"), old_format, adapter)?;
         let mut map = self.state.iter_mut().map(|(id, single)| (id.clone(), single)).collect();
-        S::load_from_checkpoint(&mut map, path, old_format)
+        S::load_from_checkpoint_with_skip(&mut map, path, old_format, adapter, &self.stateless)
     }
 }
 
@@ -220,6 +350,10 @@ where
         self.optimiser.reset()
     }
 
+    fn init_velocity(&mut self, value: f32) -> Result<(), D::DeviceError> {
+        self.optimiser.init_velocity(value)
+    }
+
     fn set_params(&mut self, params: Self::Params) {
         self.optimiser.set_params(params.into());
     }
@@ -228,252 +362,14 @@ where
         map: &mut HashMap<String, &mut Self>,
         path: &str,
         old_format: bool,
+        adapter: &dyn CheckpointShapeAdapter,
     ) -> Result<(), OperationError<D::DeviceError>> {
         let mut map = map.iter_mut().map(|(id, single)| (id.clone(), &mut single.optimiser)).collect();
-        O::load_from_checkpoint(&mut map, path, old_format)
+        O::load_from_checkpoint(&mut map, path, old_format, adapter)
     }
 
     fn write_to_checkpoint(map: &HashMap<String, &Self>, path: &str) -> Result<(), D::DeviceError> {
         let map = map.iter().map(|(id, single)| (id.clone(), &single.optimiser)).collect();
         O::write_to_checkpoint(&map, path)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-
-    use crate::{
-        device::{
-            cpu::CpuThread,
-            tensor::{DenseMatrix, Shape},
-            OperationError,
-        },
-        graph::{
-            builder::{GraphBuilder, InitSettings},
-            Graph,
-        },
-    };
-
-    use super::{
-        adam::{AdamW, AdamWParams},
-        ranger21::{NormLossPlacement, Ranger21, Ranger21Params},
-        AdditionalUpdate, Optimiser, OptimiserState,
-    };
-
-    struct SetWeightUpdate {
-        id: &'static str,
-        value: f32,
-    }
-
-    impl AdditionalUpdate<CpuThread> for SetWeightUpdate {
-        fn apply_update(
-            &mut self,
-            graph: &mut Graph<CpuThread>,
-        ) -> Result<(), OperationError<<CpuThread as crate::device::Device>::DeviceError>> {
-            graph.get_weights(self.id).dense_mut().set_to(self.value)?;
-            Ok(())
-        }
-    }
-
-    fn dense_values(weights: &DenseMatrix<CpuThread>) -> Vec<f32> {
-        let mut values = vec![0.0; weights.size()];
-        weights.write_to_slice(&mut values).unwrap();
-        values
-    }
-
-    fn reference_ranger21_update(
-        weight: f32,
-        grad: f32,
-        step: usize,
-        learning_rate: f32,
-        params: Ranger21Params,
-    ) -> f32 {
-        let beta1_sq = params.beta1 * params.beta1;
-        let momentum = (1.0 - beta1_sq) * grad;
-        let velocity = (1.0 - params.beta2) * grad * grad;
-        let bias_correction1 = 1.0 - params.beta1.powi(step as i32);
-        let bias_correction2 = 1.0 - params.beta2.powi(step as i32);
-        let noise_norm = ((1.0f32 + params.beta2).powi(2) + params.beta2.powi(2)).sqrt();
-        let denom = (velocity / bias_correction2).sqrt() + params.eps;
-        weight - learning_rate * momentum / (bias_correction1 * noise_norm * denom)
-    }
-
-    fn reference_ranger21_pnm_zero_update(
-        weight: f32,
-        grad: f32,
-        step: usize,
-        learning_rate: f32,
-        params: Ranger21Params,
-        momentum: &mut f32,
-        velocity: &mut f32,
-    ) -> f32 {
-        let beta1_sq = params.beta1 * params.beta1;
-        *momentum = beta1_sq * *momentum + (1.0 - beta1_sq) * grad;
-        *velocity = params.beta2 * *velocity + (1.0 - params.beta2) * grad * grad;
-
-        let bias_correction1 = 1.0 - params.beta1.powi(step as i32);
-        let bias_correction2 = 1.0 - params.beta2.powi(step as i32);
-        let noise_norm = ((1.0f32 + params.beta2).powi(2) + params.beta2.powi(2)).sqrt();
-        let denom = (*velocity / bias_correction2).sqrt() + params.eps;
-        weight - learning_rate * *momentum / (bias_correction1 * noise_norm * denom)
-    }
-
-    fn reference_norm_loss(weight: f32, learning_rate: f32, params: Ranger21Params) -> f32 {
-        let unit_norm = weight.abs();
-        let correction = 2.0 * params.norm_loss_factor * (1.0 - 1.0 / (unit_norm + params.eps));
-        weight * (1.0 - learning_rate * correction)
-    }
-
-    #[test]
-    fn optimiser_runs_batch_start_updates_on_request_only() {
-        let builder = GraphBuilder::default();
-        builder.new_weights("w", Shape::new(1, 1), InitSettings::Zeroed);
-        let graph = builder.build(CpuThread);
-        let mut optimiser: Optimiser<CpuThread, _, AdamW<CpuThread>> =
-            Optimiser::new(graph, AdamWParams::default()).unwrap();
-
-        optimiser.add_batch_start_update(SetWeightUpdate { id: "w", value: 0.5 });
-        assert_eq!(dense_values(&optimiser.graph.get_weights("w").dense()), vec![0.0]);
-
-        optimiser.run_batch_start_updates().unwrap();
-        assert_eq!(dense_values(&optimiser.graph.get_weights("w").dense()), vec![0.5]);
-    }
-
-    #[test]
-    fn ranger21_first_step_matches_nnue_pytorch_adamw_pnm_zero() {
-        let device = Arc::new(CpuThread);
-        let mut weights = DenseMatrix::zeroed(device.clone(), 2, None).unwrap();
-        weights.load_from_slice(None, &[1.0, -2.0]).unwrap();
-        let mut grads = DenseMatrix::zeroed(device.clone(), 2, None).unwrap();
-        grads.load_from_slice(None, &[0.5, -0.25]).unwrap();
-
-        let params = Ranger21Params { clip: None, ..Default::default() };
-        let mut optimiser = Ranger21::<CpuThread>::new(device, 2, params).unwrap();
-        optimiser.update(&mut weights, &mut grads, 1.0, 0.001).unwrap();
-
-        let actual = dense_values(&weights);
-        let expected = [
-            reference_ranger21_update(1.0, 0.5, 1, 0.001, params),
-            reference_ranger21_update(-2.0, -0.25, 1, 0.001, params),
-        ];
-
-        for (actual, expected) in actual.iter().zip(expected) {
-            assert!((actual - expected).abs() < 1.0e-7, "{actual} != {expected}");
-        }
-    }
-
-    #[test]
-    fn ranger21_lookahead_cache_starts_from_initial_weights() {
-        let device = Arc::new(CpuThread);
-        let mut weights = DenseMatrix::zeroed(device.clone(), 2, None).unwrap();
-        weights.load_from_slice(None, &[1.0, -2.0]).unwrap();
-        let mut grads = DenseMatrix::zeroed(device.clone(), 2, None).unwrap();
-        grads.load_from_slice(None, &[0.0, 0.0]).unwrap();
-
-        let params = Ranger21Params { clip: None, ..Default::default() };
-        let mut optimiser = Ranger21::<CpuThread>::new(device, 2, params).unwrap();
-        for _ in 0..params.lookahead_mergetime {
-            optimiser.update(&mut weights, &mut grads, 1.0, 0.001).unwrap();
-        }
-
-        assert_eq!(dense_values(&weights), vec![1.0, -2.0]);
-    }
-
-    #[test]
-    fn ranger21_second_step_uses_alternating_pnm_buffers() {
-        let device = Arc::new(CpuThread);
-        let mut weights = DenseMatrix::zeroed(device.clone(), 1, None).unwrap();
-        weights.load_from_slice(None, &[1.0]).unwrap();
-        let mut grads = DenseMatrix::zeroed(device.clone(), 1, None).unwrap();
-        grads.load_from_slice(None, &[0.5]).unwrap();
-
-        let params = Ranger21Params { clip: None, ..Default::default() };
-        let mut optimiser = Ranger21::<CpuThread>::new(device, 1, params).unwrap();
-        optimiser.update(&mut weights, &mut grads, 1.0, 0.001).unwrap();
-        optimiser.update(&mut weights, &mut grads, 1.0, 0.001).unwrap();
-
-        let mut pos_momentum = 0.0;
-        let mut neg_momentum = 0.0;
-        let mut velocity = 0.0;
-        let weight_after_step1 =
-            reference_ranger21_pnm_zero_update(1.0, 0.5, 1, 0.001, params, &mut pos_momentum, &mut velocity);
-        let expected = reference_ranger21_pnm_zero_update(
-            weight_after_step1,
-            0.5,
-            2,
-            0.001,
-            params,
-            &mut neg_momentum,
-            &mut velocity,
-        );
-        let actual = dense_values(&weights)[0];
-
-        assert!((actual - expected).abs() < 1.0e-7, "{actual} != {expected}");
-    }
-
-    #[test]
-    fn ranger21_applies_nnue_pytorch_norm_loss_before_adam_when_configured() {
-        let device = Arc::new(CpuThread);
-        let mut weights = DenseMatrix::zeroed(device.clone(), 1, None).unwrap();
-        weights.load_from_slice(None, &[0.25]).unwrap();
-        let mut grads = DenseMatrix::zeroed(device.clone(), 1, None).unwrap();
-        grads.load_from_slice(None, &[0.5]).unwrap();
-
-        let params = Ranger21Params {
-            clip: None,
-            norm_loss_factor: 1.0e-4,
-            norm_loss_placement: NormLossPlacement::Before,
-            ..Default::default()
-        };
-        let mut optimiser = Ranger21::<CpuThread>::new(device, 1, params).unwrap();
-        optimiser.update(&mut weights, &mut grads, 1.0, 0.001).unwrap();
-
-        let normed = reference_norm_loss(0.25, 0.001, params);
-        let expected = reference_ranger21_update(normed, 0.5, 1, 0.001, params);
-        let actual = dense_values(&weights)[0];
-
-        assert!((actual - expected).abs() < 1.0e-7, "{actual} != {expected}");
-    }
-
-    #[test]
-    fn ranger21_applies_nnue_pytorch_norm_loss_after_adam_when_configured() {
-        let device = Arc::new(CpuThread);
-        let mut weights = DenseMatrix::zeroed(device.clone(), 1, None).unwrap();
-        weights.load_from_slice(None, &[0.25]).unwrap();
-        let mut grads = DenseMatrix::zeroed(device.clone(), 1, None).unwrap();
-        grads.load_from_slice(None, &[0.5]).unwrap();
-
-        let params = Ranger21Params {
-            clip: None,
-            norm_loss_factor: 1.0e-4,
-            norm_loss_placement: NormLossPlacement::After,
-            ..Default::default()
-        };
-        let mut optimiser = Ranger21::<CpuThread>::new(device, 1, params).unwrap();
-        optimiser.update(&mut weights, &mut grads, 1.0, 0.001).unwrap();
-
-        let updated = reference_ranger21_update(0.25, 0.5, 1, 0.001, params);
-        let expected = reference_norm_loss(updated, 0.001, params);
-        let actual = dense_values(&weights)[0];
-
-        assert!((actual - expected).abs() < 2.0e-7, "{actual} != {expected}");
-    }
-
-    #[test]
-    fn clip_with_repeated_offset_keeps_effective_weights_in_range() {
-        let device = Arc::new(CpuThread);
-        let mut weights = DenseMatrix::zeroed(device.clone(), 8, None).unwrap();
-        weights.load_from_slice(None, &[2.0, -2.0, 0.25, -0.25, 0.75, -0.75, 1.5, -1.5]).unwrap();
-        let mut shared = DenseMatrix::zeroed(device.clone(), 4, None).unwrap();
-        shared.load_from_slice(None, &[0.5, -0.25, 0.25, -0.5]).unwrap();
-
-        weights.clip_with_repeated_offset(4, 2, &shared, 2, 2, -1.0, 1.0).unwrap();
-
-        let actual = dense_values(&weights);
-        let expected = [0.5, -0.75, 0.25, -0.25, 0.75, -0.5, 0.75, -0.5];
-        for (actual, expected) in actual.iter().zip(expected) {
-            assert!((actual - expected).abs() < 1.0e-7, "{actual} != {expected}");
-        }
     }
 }

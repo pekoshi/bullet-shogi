@@ -123,6 +123,23 @@ impl<B: BackendMarker> GraphIRManager<B> {
         Ok(node)
     }
 
+    /// **勾配を持たない重み** (真の凍結)。  2026-11-03
+    ///
+    /// `add_weights` との違いは `requires_grad = false` の 1 点だけ。
+    /// - compile が Gradients tensor を作らないので、 勾配バッファと optimiser 状態が
+    ///   **確保されない** (threat_ft_w 5,548 万で GPU 16 B/param = 846 MiB / host 8 B = 423 MiB)。
+    /// - `weights` 集合には入れるので `weight_ids()` / `write_to_file` / `load_from_file` に
+    ///   そのまま乗る = weights.bin に出るし resume でも読める。
+    /// - 消費側の演算はすべて `maybe_get_ref(.., Gradients)` で片側欠落を許す造りなので、
+    ///   この重みを使う経路は「入力側だけ勾配が流れる」ことになる。
+    ///
+    /// 🚨既定では誰も呼ばない。 呼ぶのは学習器の `--threat-freeze-hard` だけ。
+    pub fn add_weights_frozen(&mut self, id: &str, shape: Shape) -> GraphIRResult<AnnotatedNode, B> {
+        let node = self.add_leaf(Some(id.to_string()), shape, false, false, None)?;
+        self.weights.insert(node.idx);
+        Ok(node)
+    }
+
     pub fn add_op(&mut self, operation: impl GraphIROperationCompilable<B>) -> GraphIRResult<AnnotatedNode, B> {
         let op: Rc<dyn GraphIROperationCompilable<B>> = Rc::new(operation);
         let idx = self.inner.add_node(op)?;

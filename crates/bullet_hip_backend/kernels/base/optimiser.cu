@@ -1,9 +1,10 @@
+constexpr float Epsilon = 0.00000001F;
+
 __device__ __forceinline__ void adamOp(
     const float beta1,
     const float beta2,
     const float adj,
     const float rate,
-    const float eps,
     const float decay,
     const float wmin,
     const float wmax,
@@ -20,7 +21,7 @@ __device__ __forceinline__ void adamOp(
     v[0] = beta2 * v[0] + (1.0F - beta2) * grad * grad;
 
     float val = m[0];
-    if (denom) val /= sqrt(v[0]) + eps;
+    if (denom) val /= sqrt(v[0]) + Epsilon;
     p[0] -= rate * val;
 
     p[0] = min(max(p[0], wmin), wmax);
@@ -32,7 +33,6 @@ __global__ void AdamKernel(
     const float beta2,
     const float adj,
     const float rate,
-    const float eps,
     const float decay,
     const float min,
     const float max,
@@ -51,10 +51,10 @@ __global__ void AdamKernel(
         float4 v = ((float4 *)velocity)[tid];
         const float4 g = ((const float4 *)gradients)[tid];
 
-        adamOp(beta1, beta2, adj, rate, eps, decay, min, max, denom, &p.x, &m.x, &v.x, &g.x);
-        adamOp(beta1, beta2, adj, rate, eps, decay, min, max, denom, &p.y, &m.y, &v.y, &g.y);
-        adamOp(beta1, beta2, adj, rate, eps, decay, min, max, denom, &p.z, &m.z, &v.z, &g.z);
-        adamOp(beta1, beta2, adj, rate, eps, decay, min, max, denom, &p.w, &m.w, &v.w, &g.w);
+        adamOp(beta1, beta2, adj, rate, decay, min, max, denom, &p.x, &m.x, &v.x, &g.x);
+        adamOp(beta1, beta2, adj, rate, decay, min, max, denom, &p.y, &m.y, &v.y, &g.y);
+        adamOp(beta1, beta2, adj, rate, decay, min, max, denom, &p.z, &m.z, &v.z, &g.z);
+        adamOp(beta1, beta2, adj, rate, decay, min, max, denom, &p.w, &m.w, &v.w, &g.w);
 
         ((float4 *)network)[tid] = p;
         ((float4 *)momentum)[tid] = m;
@@ -65,7 +65,7 @@ __global__ void AdamKernel(
         for (int32_t i = 0; i < size - 4 * tid; i++)
         {
             const int32_t j = 4 * tid + i;
-            adamOp(beta1, beta2, adj, rate, eps, decay, min, max, denom, &network[j], &momentum[j], &velocity[j], &gradients[j]);
+            adamOp(beta1, beta2, adj, rate, decay, min, max, denom, &network[j], &momentum[j], &velocity[j], &gradients[j]);
         }
     }
 }
@@ -94,34 +94,12 @@ __global__ void ClipKernel(const int32_t size, float* params, const float min_we
     }
 }
 
-__global__ void ClipWithRepeatedOffsetKernel(
-    const int32_t rows,
-    const int32_t cols,
-    float* params,
-    const float* offset,
-    const int32_t offset_rows,
-    const int32_t offset_cols,
-    const float min_weight,
-    const float max_weight) {
-    const int32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-    const int32_t size = rows * cols;
-
-    if (tid < size)
-    {
-        const int32_t row = tid % rows;
-        const int32_t col = tid / rows;
-        const float shared = offset[(col % offset_cols) * offset_rows + (row % offset_rows)];
-        params[tid] = min(max(params[tid] + shared, min_weight), max_weight) - shared;
-    }
-}
-
 extern "C" void Adam(
     const size_t size,
     const float beta1,
     const float beta2,
     const float adj,
     const float rate,
-    const float eps,
     const bool denom,
     const float decay,
     const float min,
@@ -140,7 +118,6 @@ extern "C" void Adam(
         beta2,
         adj,
         rate,
-        eps,
         decay,
         min,
         max,
@@ -157,19 +134,4 @@ extern "C" void clip(const size_t size, float* params, const float min_weight, c
     const size_t float4_size = (size + 3) / 4;
     const size_t blocks = (float4_size + threads - 1) / threads;
     ClipKernel<<<blocks, threads>>>(size, params, min_weight, max_weight);
-}
-
-extern "C" void clip_with_repeated_offset(
-    const size_t rows,
-    const size_t cols,
-    float* params,
-    const float* offset,
-    const size_t offset_rows,
-    const size_t offset_cols,
-    const float min_weight,
-    const float max_weight) {
-    const size_t threads = 1024;
-    const size_t size = rows * cols;
-    const size_t blocks = (size + threads - 1) / threads;
-    ClipWithRepeatedOffsetKernel<<<blocks, threads>>>(rows, cols, params, offset, offset_rows, offset_cols, min_weight, max_weight);
 }

@@ -8,8 +8,10 @@
 
 pub mod bona_piece;
 pub mod packed_sfen;
+pub mod packed_sfen_with_visits;
 pub mod types;
 
 pub use bona_piece::BonaPiece;
 pub use packed_sfen::{BitStream, PackedSfen, PackedSfenValue, ShogiBoard};
+pub use packed_sfen_with_visits::{MAX_VISITS_PER_POS, MoveVisit, PackedSfenWithVisits};
 pub use types::{Color, Hand, Piece, PieceType, Square};

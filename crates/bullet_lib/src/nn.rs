@@ -1,8 +1,8 @@
 pub use acyclib::{
     device::tensor::Shape,
     graph::{
-        builder::{Affine, GraphBuilder as NetworkBuilder, GraphBuilderNode as NetworkBuilderNode, InitSettings},
         Node,
+        builder::{Affine, GraphBuilder as NetworkBuilder, GraphBuilderNode as NetworkBuilderNode, InitSettings},
     },
 };
 
@@ -23,18 +23,17 @@ pub use bullet_cuda_backend::{CudaDevice as ExecutionContext, CudaError as Devic
 
 pub mod optimiser {
     use crate::nn::ExecutionContext;
-    use acyclib::trainer::optimiser::{self, radam, OptimiserState};
+    use acyclib::trainer::optimiser::{self, OptimiserState, radam};
 
     pub type AdamWOptimiser = optimiser::adam::AdamW<ExecutionContext>;
     pub type RAdamOptimiser = radam::RAdam<ExecutionContext>;
     pub type RangerOptimiser = optimiser::ranger::Ranger<ExecutionContext>;
     pub type Ranger21Optimiser = optimiser::ranger21::Ranger21<ExecutionContext>;
     pub use optimiser::{
+        Optimiser,
         adam::AdamWParams,
-        nnue_clip::NnuePytorchClipping,
         ranger::RangerParams,
         ranger21::{NormLossPlacement, Ranger21Params},
-        Optimiser,
     };
 
     pub trait OptimiserType: Default {

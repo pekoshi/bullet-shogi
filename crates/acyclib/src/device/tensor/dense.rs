@@ -1,6 +1,6 @@
 use std::{fmt, num::NonZeroUsize, sync::Arc};
 
-use crate::device::{operation::BaseOperations, tensor::rng, Device, DeviceBuffer, OperationError};
+use crate::device::{Device, DeviceBuffer, OperationError, operation::BaseOperations, tensor::rng};
 
 pub struct DenseMatrix<D: Device> {
     pub buf: D::BufferF32,
@@ -55,24 +55,6 @@ impl<D: Device> DenseMatrix<D> {
 
     pub fn clamp(&mut self, min: f32, max: f32) -> Result<(), OperationError<D::DeviceError>> {
         self.buf.clip(self.size(), min, max)?;
-        Ok(())
-    }
-
-    pub fn clip_with_repeated_offset(
-        &mut self,
-        rows: usize,
-        cols: usize,
-        offset: &Self,
-        offset_rows: usize,
-        offset_cols: usize,
-        min: f32,
-        max: f32,
-    ) -> Result<(), OperationError<D::DeviceError>> {
-        if self.size() != rows * cols || offset.size() != offset_rows * offset_cols {
-            return Err(OperationError::IndexOutOfBounds);
-        }
-
-        self.buf.clip_with_repeated_offset(rows, cols, &offset.buf, offset_rows, offset_cols, min, max)?;
         Ok(())
     }
 
@@ -158,6 +140,18 @@ impl<D: Device> DenseMatrix<D> {
         self.buf.set_to(self.size(), val)
     }
 
+    /// 連続部分範囲 `[start, end)` を `val` で埋める (device 上で完結)。
+    ///
+    /// `run_with_zeroed_rows` の post-step zero projection 用: 全行列の
+    /// GPU→CPU→GPU 往復 (l0w で数百 MB/step) を避ける。 範囲は `self.size()` 以内。
+    pub fn set_range_to(&mut self, start: usize, end: usize, val: f32) -> Result<(), D::DeviceError> {
+        if start > end || end > self.size() {
+            return Err(D::DeviceError::default());
+        }
+
+        self.buf.set_range_to(start, end, val)
+    }
+
     /// Writes the contents of this matrix into a buffer,
     /// returns number of values written.
     pub fn write_to_slice(&self, buf: &mut [f32]) -> Result<usize, D::DeviceError> {
@@ -203,6 +197,95 @@ impl<D: Device> DenseMatrix<D> {
         }
 
         Ok(buf)
+    }
+}
+
+// ============================================================================
+// Phase 2 (IV案) 追加: DenseMatrixF16
+// ============================================================================
+//
+// 既存 `DenseMatrix<D>` (f32) は無改造で残す。 新規 `DenseMatrixF16<D>` を
+// 平行型として追加し、 中間 activation buffer 用に使う (weight master と grad
+// は f32 のまま、 forward の中間 storage のみ f16)。
+//
+// API は最小限 (alloc / load / write / size 系) のみ提供する。
+// 演算 (gemm, lerp, clamp, scale 等) は要求しない: 既存 BufferF16 trait + 専用
+// kernel (silu_f16, add_silu_f16, cast_f16_to_f32 等) で代替する。
+
+/// BufferF16 を担う dense 行列。 IV案 mixed precision で activation の中間 storage 用。
+pub struct DenseMatrixF16<D: Device> {
+    pub buf: D::BufferF16,
+    single_size: usize,
+    batch_size: Option<NonZeroUsize>,
+}
+
+impl<D: Device> fmt::Debug for DenseMatrixF16<D> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}x{:?}xf16", self.single_size, self.batch_size)
+    }
+}
+
+impl<D: Device> DenseMatrixF16<D> {
+    pub fn zeroed(device: Arc<D>, single_size: usize, batch_size: Option<usize>) -> Result<Self, D::DeviceError> {
+        let buf = D::BufferF16::new(device, single_size * batch_size.unwrap_or(1))?;
+        Ok(Self { buf, single_size, batch_size: batch_size.map(|b| b.try_into().unwrap()) })
+    }
+
+    pub fn allocated_size(&self) -> usize {
+        self.buf.size()
+    }
+
+    pub fn size(&self) -> usize {
+        self.single_size() * self.batch_size().unwrap_or(1)
+    }
+
+    pub fn single_size(&self) -> usize {
+        self.single_size
+    }
+
+    pub fn batch_size(&self) -> Option<usize> {
+        self.batch_size.map(NonZeroUsize::get)
+    }
+
+    pub fn set_batch_size(&mut self, batch_size: Option<usize>) -> Result<(), D::DeviceError> {
+        let new_size = self.single_size() * batch_size.unwrap_or(1);
+        if new_size > self.allocated_size() {
+            self.buf = D::BufferF16::new(self.buf.device(), new_size)?;
+        } else if batch_size != self.batch_size() {
+            self.buf.set_zero()?;
+        }
+
+        self.batch_size = batch_size.map(|x| NonZeroUsize::new(x).unwrap());
+
+        Ok(())
+    }
+
+    pub fn load_from_slice(&mut self, batch_size: Option<usize>, buf: &[half::f16]) -> Result<(), D::DeviceError> {
+        if self.single_size() * batch_size.unwrap_or(1) != buf.len() {
+            return Err(D::DeviceError::default());
+        }
+
+        self.set_batch_size(batch_size)?;
+        self.buf.load_from_slice(buf)
+    }
+
+    pub fn write_to_slice(&self, buf: &mut [half::f16]) -> Result<usize, D::DeviceError> {
+        if self.size() > buf.len() {
+            return Err(D::DeviceError::default());
+        }
+
+        self.buf.write_into_slice(buf, self.size())?;
+        Ok(self.allocated_size())
+    }
+
+    pub fn swap_with(&mut self, other: &mut Self) -> Result<(), D::DeviceError> {
+        if self.single_size != other.single_size {
+            return Err(D::DeviceError::default());
+        }
+
+        std::mem::swap(self, other);
+
+        Ok(())
     }
 }
 

@@ -1,4 +1,6 @@
+pub mod builder;
 pub mod device;
+pub mod inference;
 pub mod kernel;
 pub mod ops;
 

@@ -1,16 +1,16 @@
 use std::sync::Arc;
 
 use acyclib::device::{
-    operation::{AdamConfig, BaseOperations, DiffableFromOutput, GemmConfig},
-    tensor::Shape,
     DeviceBuffer,
+    operation::{AdamConfig, BaseOperations, DiffableFromOutput, GemmConfig, Ranger21Config},
+    tensor::Shape,
 };
 use cudarc::{
     cublas::Gemm,
     driver::{CudaSlice, DriverError, PushKernelArg},
 };
 
-use crate::{convert_gemm_config, CudaBuffer, CudaDevice, CudaError};
+use crate::{CudaBuffer, CudaDevice, CudaError, convert_gemm_config};
 
 pub(crate) fn set_to(
     device: Arc<CudaDevice>,
@@ -41,6 +41,31 @@ impl BaseOperations for CudaBuffer<f32> {
         set_to(self.device.clone(), &mut self.buf, size, val).map_err(CudaError::Driver)
     }
 
+    fn set_range_to(&mut self, start: usize, end: usize, val: f32) -> Result<(), Self::BaseError> {
+        if start > end || end > self.buf.len() {
+            return Err(CudaError::ExpectedIllegalAddressAccess);
+        }
+        if start == end {
+            return Ok(());
+        }
+
+        let size = end - start;
+        let func = self.device.module().load_function("SetKernel").map_err(CudaError::Driver)?;
+
+        unsafe {
+            self.device
+                .stream()
+                .launch_builder(&func)
+                .arg(&mut self.buf.slice_mut(start..end))
+                .arg(&(size as i32))
+                .arg(&val)
+                .launch(CudaDevice::elementwise_launch_params_single(size, 512))
+                .map_err(CudaError::Driver)?;
+        }
+
+        Ok(())
+    }
+
     fn diffable_from_output_fwd(
         &mut self,
         size: usize,
@@ -54,6 +79,7 @@ impl BaseOperations for CudaBuffer<f32> {
             DiffableFromOutput::SCReLU => "ForwardScreluKernel",
             DiffableFromOutput::SqrReLU => "ForwardSqrReluKernel",
             DiffableFromOutput::Sigmoid => "ForwardSigmoidKernel",
+            DiffableFromOutput::LeakyReLU => "ForwardLeakyReluKernel",
         };
 
         let func = self.device.module().load_function(func_name).map_err(CudaError::Driver)?;
@@ -86,6 +112,7 @@ impl BaseOperations for CudaBuffer<f32> {
             DiffableFromOutput::SCReLU => "BackwardScreluKernel",
             DiffableFromOutput::SqrReLU => "BackwardSqrReluKernel",
             DiffableFromOutput::Sigmoid => "BackwardSigmoidKernel",
+            DiffableFromOutput::LeakyReLU => "BackwardLeakyReluKernel",
         };
 
         let func = self.device.module().load_function(func_name).map_err(CudaError::Driver)?;
@@ -232,6 +259,178 @@ impl BaseOperations for CudaBuffer<f32> {
                 .arg(&grd.buf.slice(0..size))
                 .arg(&mut self.buf.slice_mut(0..size))
                 .launch(CudaDevice::elementwise_launch_params(size, 512))
+                .map_err(CudaError::Driver)?;
+        }
+
+        Ok(())
+    }
+
+    fn silu_fwd(&mut self, size: usize, input: &Self) -> Result<(), Self::BaseError> {
+        let func = self.device.module().load_function("ForwardSiluKernel").map_err(CudaError::Driver)?;
+
+        unsafe {
+            self.device
+                .stream()
+                .launch_builder(&func)
+                .arg(&(size as i32))
+                .arg(&input.buf.slice(0..size))
+                .arg(&mut self.buf.slice_mut(0..size))
+                .launch(CudaDevice::elementwise_launch_params(size, 512))
+                .map_err(CudaError::Driver)?;
+        }
+
+        Ok(())
+    }
+
+    fn silu_bwd(&mut self, size: usize, input: &Self, output_grad: &Self) -> Result<(), Self::BaseError> {
+        let func = self.device.module().load_function("BackwardSiluKernel").map_err(CudaError::Driver)?;
+
+        unsafe {
+            self.device
+                .stream()
+                .launch_builder(&func)
+                .arg(&(size as i32))
+                .arg(&input.buf.slice(0..size))
+                .arg(&output_grad.buf.slice(0..size))
+                .arg(&mut self.buf.slice_mut(0..size))
+                .launch(CudaDevice::elementwise_launch_params(size, 512))
+                .map_err(CudaError::Driver)?;
+        }
+
+        Ok(())
+    }
+
+    fn rms_norm_fwd(
+        &mut self,
+        feature_size: usize,
+        batch_size: usize,
+        eps: f32,
+        input: &Self,
+    ) -> Result<(), Self::BaseError> {
+        let total = feature_size * batch_size;
+        if total > input.size() || total > self.size() {
+            return Err(CudaError::ExpectedIllegalAddressAccess);
+        }
+        let func = self.device.module().load_function("RmsNormKernel").map_err(CudaError::Driver)?;
+
+        let threads_per_block: u32 = 256;
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (batch_size as u32, 1, 1),
+            block_dim: (threads_per_block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        unsafe {
+            self.device
+                .stream()
+                .launch_builder(&func)
+                .arg(&(feature_size as i32))
+                .arg(&eps)
+                .arg(&input.buf.slice(0..total))
+                .arg(&mut self.buf.slice_mut(0..total))
+                .launch(cfg)
+                .map_err(CudaError::Driver)?;
+        }
+
+        Ok(())
+    }
+
+    fn rms_norm_bwd(
+        &mut self,
+        feature_size: usize,
+        batch_size: usize,
+        eps: f32,
+        input: &Self,
+        output_grad: &Self,
+    ) -> Result<(), Self::BaseError> {
+        let total = feature_size * batch_size;
+        if total > input.size() || total > output_grad.size() || total > self.size() {
+            return Err(CudaError::ExpectedIllegalAddressAccess);
+        }
+        let func = self.device.module().load_function("RmsNormBackwardKernel").map_err(CudaError::Driver)?;
+
+        let threads_per_block: u32 = 256;
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (batch_size as u32, 1, 1),
+            block_dim: (threads_per_block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        unsafe {
+            self.device
+                .stream()
+                .launch_builder(&func)
+                .arg(&(feature_size as i32))
+                .arg(&eps)
+                .arg(&input.buf.slice(0..total))
+                .arg(&output_grad.buf.slice(0..total))
+                .arg(&mut self.buf.slice_mut(0..total))
+                .launch(cfg)
+                .map_err(CudaError::Driver)?;
+        }
+
+        Ok(())
+    }
+
+    fn softmax_fwd(&mut self, feature_size: usize, batch_size: usize, input: &Self) -> Result<(), Self::BaseError> {
+        let total = feature_size * batch_size;
+        if total > input.size() || total > self.size() {
+            return Err(CudaError::ExpectedIllegalAddressAccess);
+        }
+        // 譌｢蟄・"softmax" kernel 繧呈ｵ∫畑 (rows = feature_size, cols = batch_size)
+        let func = self.device.module().load_function("softmax").map_err(CudaError::Driver)?;
+
+        let threads: u32 = 512;
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: ((batch_size as u32).div_ceil(threads), 1, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        unsafe {
+            self.device
+                .stream()
+                .launch_builder(&func)
+                .arg(&(feature_size as i32))
+                .arg(&(batch_size as i32))
+                .arg(&input.buf.slice(0..total))
+                .arg(&mut self.buf.slice_mut(0..total))
+                .launch(cfg)
+                .map_err(CudaError::Driver)?;
+        }
+
+        Ok(())
+    }
+
+    fn softmax_bwd(
+        &mut self,
+        feature_size: usize,
+        batch_size: usize,
+        softmax_out: &Self,
+        output_grad: &Self,
+    ) -> Result<(), Self::BaseError> {
+        let total = feature_size * batch_size;
+        if total > softmax_out.size() || total > output_grad.size() || total > self.size() {
+            return Err(CudaError::ExpectedIllegalAddressAccess);
+        }
+        let func = self.device.module().load_function("SoftmaxBackwardKernel").map_err(CudaError::Driver)?;
+
+        let threads_per_block: u32 = 256;
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (batch_size as u32, 1, 1),
+            block_dim: (threads_per_block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        unsafe {
+            self.device
+                .stream()
+                .launch_builder(&func)
+                .arg(&(feature_size as i32))
+                .arg(&softmax_out.buf.slice(0..total))
+                .arg(&output_grad.buf.slice(0..total))
+                .arg(&mut self.buf.slice_mut(0..total))
+                .launch(cfg)
                 .map_err(CudaError::Driver)?;
         }
 
@@ -411,37 +610,6 @@ impl BaseOperations for CudaBuffer<f32> {
         Ok(())
     }
 
-    fn clip_with_repeated_offset(
-        &mut self,
-        rows: usize,
-        cols: usize,
-        offset: &Self,
-        offset_rows: usize,
-        offset_cols: usize,
-        min: f32,
-        max: f32,
-    ) -> Result<(), Self::BaseError> {
-        let func = self.device.module().load_function("ClipWithRepeatedOffsetKernel").map_err(CudaError::Driver)?;
-
-        unsafe {
-            self.device
-                .stream()
-                .launch_builder(&func)
-                .arg(&(rows as i32))
-                .arg(&(cols as i32))
-                .arg(&mut self.buf.slice_mut(0..rows * cols))
-                .arg(&offset.buf.slice(0..offset_rows * offset_cols))
-                .arg(&(offset_rows as i32))
-                .arg(&(offset_cols as i32))
-                .arg(&min)
-                .arg(&max)
-                .launch(CudaDevice::elementwise_launch_params(rows * cols, 1024))
-                .map_err(CudaError::Driver)?;
-        }
-
-        Ok(())
-    }
-
     fn adam(
         &mut self,
         config: &AdamConfig,
@@ -452,7 +620,7 @@ impl BaseOperations for CudaBuffer<f32> {
     ) -> Result<(), Self::BaseError> {
         let func = self.device.module().load_function("AdamKernel").map_err(CudaError::Driver)?;
 
-        let (min, max) = config.clip.unwrap_or((f32::MIN, f32::MAX));
+        let (min, max) = config.clip.unwrap_or((1.0, 1.0));
 
         unsafe {
             self.device
@@ -472,10 +640,60 @@ impl BaseOperations for CudaBuffer<f32> {
                 .arg(&mut mom.buf.slice_mut(0..size))
                 .arg(&mut vel.buf.slice_mut(0..size))
                 .arg(&grd.buf.slice(0..size))
+                // Ranger21Kernel は float4 単位で更新し、guard は `tid < size / 4`。
+                // elementwise_launch_params が内部で size を 4 で割る (float4 化) ため、
+                // ここでは素の size を渡す。div_ceil(4) を重ねると二重に割られ、
+                // 各テンソルの先頭 25% しか更新されない (2026-08-27 混入・09-05 修正)。
                 .launch(CudaDevice::elementwise_launch_params(size, 1024))
                 .map_err(CudaError::Driver)?;
         }
 
+        Ok(())
+    }
+
+    fn ranger21(
+        &mut self,
+        config: &Ranger21Config,
+        offset: usize,
+        size: usize,
+        grd: &Self,
+        momentum: &mut Self,
+        velocity: &mut Self,
+        max_velocity: &mut Self,
+    ) -> Result<(), Self::BaseError> {
+        let func = self.device.module().load_function("Ranger21Kernel").map_err(CudaError::Driver)?;
+        // 2026-09-15: 区間 [offset, offset + size) だけを更新できるようにした (群別 lr 用)。
+        //   5 本の buffer を同じ区間の view にしてカーネルへ渡すので、 カーネル側から見ると
+        //   従来の「先頭から size 要素」と同じ。 offset = 0, size = 全長 なら従来と完全に同一。
+        let end = offset + size;
+        unsafe {
+            self.device
+                .stream()
+                .launch_builder(&func)
+                .arg(&(size as i32))
+                .arg(&config.beta0)
+                .arg(&config.beta1_sq)
+                .arg(&config.beta2)
+                .arg(&config.gradient_factor)
+                .arg(&config.step_size)
+                .arg(&config.inv_sqrt_bias_correction2)
+                .arg(&config.eps)
+                .arg(&config.decay)
+                .arg(&config.min_weight)
+                .arg(&config.max_weight)
+                .arg(&config.clamp_weights)
+                .arg(&mut self.buf.slice_mut(offset..end))
+                .arg(&mut momentum.buf.slice_mut(offset..end))
+                .arg(&mut velocity.buf.slice_mut(offset..end))
+                .arg(&mut max_velocity.buf.slice_mut(offset..end))
+                .arg(&grd.buf.slice(offset..end))
+                // Ranger21Kernel は float4 単位で更新し、guard は `tid < size / 4`。
+                // elementwise_launch_params が内部で size を 4 で割る (float4 化) ため、
+                // ここでは素の size を渡す。div_ceil(4) を重ねると二重に割られ、
+                // 各テンソルの先頭 25% しか更新されない (2026-08-27 混入・09-05 修正)。
+                .launch(CudaDevice::elementwise_launch_params(size, 1024))
+                .map_err(CudaError::Driver)?;
+        }
         Ok(())
     }
 }

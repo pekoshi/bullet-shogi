@@ -141,6 +141,12 @@ struct Args {
     /// Enable HandThreat defensive variant (30,276 dims, 非対称 emission)
     #[arg(long, default_value_t = false)]
     hand_threat_defensive: bool,
+
+    /// R-Mix / R-MixWide16: L2 入力に [skip^2, skip] を追加 (l2_in = 2*(l1-1) + 2)。
+    /// 学習側 `--residual-mix` / `--residual-wide16`、エンジン `P2_RESIDUAL_MIX16` /
+    /// `P2_RESIDUAL_MIXWIDE16` に対応。 `--integer-forward` 専用。
+    #[arg(long, default_value_t = false)]
+    residual_mix: bool,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, Default)]
@@ -624,12 +630,14 @@ fn main() {
             eprintln!("Error: quantised.bin not found: {}", quantised_path.display());
             std::process::exit(1);
         }
-        let net = QuantisedNetwork::load(&quantised_path, l0_size, l1_size, l2_size, args.scale).unwrap_or_else(|e| {
-            eprintln!("Error: Failed to load quantised.bin: {e}");
-            std::process::exit(1);
-        });
+        let net = QuantisedNetwork::load(&quantised_path, l0_size, l1_size, l2_size, args.scale, args.residual_mix)
+            .unwrap_or_else(|e| {
+                eprintln!("Error: Failed to load quantised.bin: {e}");
+                std::process::exit(1);
+            });
         println!("=== Integer Golden Forward Mode ===");
         println!("quantised.bin: {}", quantised_path.display());
+        println!("residual_mix: {}", args.residual_mix);
         run_integer_forward(
             &net,
             &args.pack,
@@ -641,6 +649,7 @@ fn main() {
             l2_size,
             threat_profile,
             use_hand_threat_defensive,
+            args.residual_mix,
         );
         return;
     }
@@ -1533,6 +1542,7 @@ impl QuantisedNetwork {
         l1_size: usize,
         l2_size: usize,
         default_fv_scale: i32,
+        residual_mix: bool,
     ) -> io::Result<Self> {
         let mut f = File::open(path)?;
         let mut buf4 = [0u8; 4];
@@ -1681,7 +1691,7 @@ impl QuantisedNetwork {
 
         // LayerStack per-bucket: [fc_hash][l1b][l1w][l2b][l2w][l3b][l3w]
         let l1_effective = l1_size - 1;
-        let l2_in_dim = l1_effective * 2;
+        let l2_in_dim = l1_effective * 2 + if residual_mix { 2 } else { 0 };
         let l1_input_dim = l0_size;
         // HandCountDense 有効時は L1 入力に hc_dims 元が concat されるため、
         // per-row のバイト数は pad32(l0_size + hc_dims)。内訳:
@@ -1788,9 +1798,10 @@ fn run_integer_forward(
     l2_size: usize,
     threat_profile: Option<ThreatProfile>,
     use_hand_threat_defensive: bool,
+    residual_mix: bool,
 ) {
     let l1_effective = l1_size - 1;
-    let l2_in_dim = l1_effective * 2;
+    let l2_in_dim = l1_effective * 2 + if residual_mix { 2 } else { 0 };
     let l1_input_dim = l0_size;
     let half = l0_size / 2;
 
@@ -1868,6 +1879,7 @@ fn run_integer_forward(
 
         println!("=== Integer Golden Forward (sample {}) ===", offset + sample_idx as u64);
         println!("SFEN: {}", sfen);
+        println!("teacher_score: {}", psv.score());
         println!("bucket_index: {}", bucket);
         if net.has_threat {
             println!("HalfKA features: {}, Threat features: {}", stm_features.len(), stm_threat.len());
@@ -1989,6 +2001,13 @@ fn run_integer_forward(
 
             // ClippedReLU: (x >> 6) clamped to [0, 127]
             l2_in[l1_effective + i] = (l1_out[i] >> 6).clamp(0, 127) as u8;
+        }
+        if residual_mix {
+            // R-Mix: [skip^2 (SqrClippedReLU), skip (ClippedReLU)] を末尾に追加。
+            // 学習側 l1_skip_raw.abs_pow(2.0) * (127/128) → crelu / l1_skip_raw → crelu と同一スケール。
+            let sk = l1_skip as i64;
+            l2_in[2 * l1_effective] = ((sk * sk) >> 19).clamp(0, 127) as u8;
+            l2_in[2 * l1_effective + 1] = (l1_skip >> 6).clamp(0, 127) as u8;
         }
 
         println!("L2 input ({}): {:?}", l2_in_dim, &l2_in);

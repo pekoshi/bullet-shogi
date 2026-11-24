@@ -17,6 +17,30 @@ use crate::{
     },
 };
 
+/// checkpoint 中のテンソルを graph 側の要素数へ変換するフック。
+///
+/// `weights.bin` と optimiser state (momentum / velocity / slow など、 重みと同形の
+/// バッファ) のロード時に **要素数が graph と一致しないエントリだけ** に対して呼ばれる。
+/// 意味を知っている呼び出し側 (例: Direct15 head の bucket / 視点 / 守備ビット展開) が
+/// レイアウトを保ったまま `expected` 要素へ変換した `Vec` を返す。 `None` を返すと
+/// 従来どおり size mismatch エラー (または `BULLET_SKIP_UNKNOWN_WEIGHTS` による skip) になる。
+///
+/// 重みと optimiser state の全バッファに同じ変換が適用されるので、 展開後も
+/// 要素ごとの対応 (weight ↔ momentum ↔ velocity ↔ slow) が保たれる。
+pub trait CheckpointShapeAdapter {
+    /// `id` のテンソルが checkpoint では `values.len()` 要素、 graph では `expected` 要素のとき呼ばれる。
+    fn adapt(&self, id: &str, values: &[f32], expected: usize) -> Option<Vec<f32>>;
+}
+
+/// 何も変換しない既定の [`CheckpointShapeAdapter`] (= 従来動作)。
+pub struct NoShapeAdapter;
+
+impl CheckpointShapeAdapter for NoShapeAdapter {
+    fn adapt(&self, _id: &str, _values: &[f32], _expected: usize) -> Option<Vec<f32>> {
+        None
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum GraphNodeIdTy {
     Values,
@@ -197,6 +221,17 @@ impl<D: Device> Graph<D> {
     /// Loads the weights of a graph from a file. If `gradients` is true,
     /// it will instead load the gradients of those weights.
     pub fn load_from_file(&mut self, path: &str, old_format: bool) -> Result<(), OperationError<D::DeviceError>> {
+        self.load_from_file_adapted(path, old_format, &NoShapeAdapter)
+    }
+
+    /// [`Self::load_from_file`] と同じだが、 要素数が graph と一致しないエントリを
+    /// `adapter` で graph 側の形状へ変換してから読み込む (変換できなければ従来どおりエラー)。
+    pub fn load_from_file_adapted(
+        &mut self,
+        path: &str,
+        old_format: bool,
+        adapter: &dyn CheckpointShapeAdapter,
+    ) -> Result<(), OperationError<D::DeviceError>> {
         use std::{fs::File, io::Read};
 
         let mut buf = Vec::new();
@@ -207,10 +242,21 @@ impl<D: Device> Graph<D> {
 
         let mut offset = 0;
 
+        // `BULLET_SKIP_UNKNOWN_WEIGHTS=1` で、 ckpt にあって graph 側に存在しない weight (例: 旧 LMAS spec の余剰 weight) を skip。
+        // size mismatch も同じ env var 経由で warn + skip 扱いにする (LMAS spec 改造で size 違いが出るケース)。
+        let skip_unknown = std::env::var("BULLET_SKIP_UNKNOWN_WEIGHTS")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+
         while offset < buf.len() {
             let (buffer, id, bytes_read) = read_from_byte_buffer(&buf[offset..], old_format);
 
             if !weight_ids.contains(&id) {
+                if skip_unknown {
+                    eprintln!("warn: skip unknown weight in ckpt: {id}");
+                    offset += bytes_read;
+                    continue;
+                }
                 return Err(OperationError::NoWeightWithID(id));
             }
 
@@ -219,9 +265,20 @@ impl<D: Device> Graph<D> {
             let mut weights = weights.dense_mut();
             let exp_size = weights.size();
 
-            if buffer.len() != exp_size {
+            let buffer = if buffer.len() == exp_size {
+                buffer
+            } else if let Some(adapted) = adapter.adapt(&id, &buffer, exp_size) {
+                if adapted.len() != exp_size {
+                    return Err(OperationError::WeightLoadingError(id, Some((adapted.len(), exp_size))));
+                }
+                adapted
+            } else if skip_unknown {
+                eprintln!("warn: skip size-mismatch weight {id}: ckpt={} vs graph={}", buffer.len(), exp_size);
+                offset += bytes_read;
+                continue;
+            } else {
                 return Err(OperationError::WeightLoadingError(id, Some((buffer.len(), exp_size))));
-            }
+            };
 
             if weights.load_from_slice(None, &buffer).is_err() {
                 return Err(OperationError::WeightLoadingError(id, None));

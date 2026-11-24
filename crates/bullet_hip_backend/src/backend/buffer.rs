@@ -11,6 +11,7 @@ use super::ExecutionContext;
 pub unsafe trait ValidType {}
 unsafe impl ValidType for f32 {}
 unsafe impl ValidType for i32 {}
+unsafe impl ValidType for half::f16 {}
 
 /// Managed memory buffer of `T` on the device.
 #[derive(Debug)]

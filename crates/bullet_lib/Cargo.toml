@@ -13,6 +13,15 @@ edition = { workspace = true }
 default = ["cuda"]
 cpu = []
 cuda = ["bullet_cuda_backend"]
+# LayerStack を P8H2(進行度8×持駒2=16 bucket)専用でビルドする。
+# shogi_layerstack example の NUM_BUCKETS を 16 に切り替え、--bucket-mode progress8hand2kpabs
+# のみを受理する(既定ビルドは 8 bucket = progress8 / P4H2 用)。C++ 推論の -DP2_LSMODE_P8H2 と対称。
+lsmode-p8h2 = []
+# 2026-11-14 OPNARCH: OPN (序盤帯専用 net) の king bucket。 shogi_layerstack の NUM_BUCKETS を
+#   81 (k9k9z、 --bucket-mode opnk9z) / 243 (k9k9z × 進行度 3、 --bucket-mode opnk9zp3) にする。
+#   どちらも fc0/fc1/fc2 を gather affine で回し、 arch に "LSMODE=K9Z," / "LSMODE=K9ZP3," が付く。
+lsmode-opn81 = []
+lsmode-opn243 = []
 hip = ["bullet_hip_backend", "bullet_hip_backend/hip", "bullet_cuda_backend?/error"]
 hip-cuda = ["bullet_hip_backend"]
 multigpu = ["bullet_cuda_backend/nccl"]
@@ -29,6 +38,12 @@ bulletformat = { workspace = true }
 montyformat = { workspace = true }
 sfbinpack = "0.6.0"
 viriformat = { workspace = true }
+# Activity-Risk Head 用 (= 2026-06-06、 推論側 rshogi-core::nnue::activity_risk と完全一致を保証)。
+# rshogi-core はラム将棋 (SH11235/rshogi) 派生の p2shogi 版を使う。 bullet-shogi と同じ親ディレクトリに置く前提。
+# 必要なのは bitboard + Position + nnue::activity_risk のみ。 layerstacks-1536x16x32 は
+# rshogi-core 内部で参照されるが evaluate 経路を bullet 側で呼ばないので link cost は最小。
+# local 訓練用に絶対パスへ変更 (= VM では ../../../rshogi/crates/rshogi-core、 commit しない)。
+rshogi-core = { path = "../../../rshogi/crates/rshogi-core", features = ["nnue-activity-risk-psqt", "nnue-king-escape-psqt", "nnue-king-danger-psqt", "nnue-attack-dev-psqt", "nnue-slider-xray-psqt", "nnue-king-mobility-psqt", "nnue-drop-pressure-psqt", "nnue-attack-relay", "nnue-attack-relay-v2", "nnue-kzt-psqt"] }
 
 [dev-dependencies]
 clap = { workspace = true }
@@ -80,8 +95,172 @@ name = "shogi_simple"
 path = "../../examples/shogi_simple.rs"
 
 [[example]]
+name = "threat_density"
+path = "../../examples/threat_density.rs"
+
+[[example]]
+name = "threat_slice_dump"
+path = "../../examples/threat_slice_dump.rs"
+
+[[example]]
+name = "threat_active_dump"
+path = "../../examples/threat_active_dump.rs"
+
+# 案 B (Regime LayerStack) の G-0: bucket x regime の件数を訓練データで数える。
+[[example]]
+name = "regime_crosstab"
+path = "../../examples/regime_crosstab.rs"
+
+[[example]]
+name = "opn_kbucket_dump"
+path = "../../examples/opn_kbucket_dump.rs"
+
+[[example]]
+name = "opn_k16_check"
+path = "../../examples/opn_k16_check.rs"
+
+[[example]]
+name = "bucketed_affine_check"
+path = "../../examples/bucketed_affine_check.rs"
+
+[[example]]
 name = "shogi_layerstack"
 path = "../../examples/shogi_layerstack.rs"
+
+[[example]]
+name = "kzt_verify"
+path = "../../examples/kzt_verify.rs"
+
+[[example]]
+name = "kzt_ft_verify"
+path = "../../examples/kzt_ft_verify.rs"
+
+[[example]]
+name = "shogi_mob_canonical"
+path = "../../examples/shogi_mob_canonical.rs"
+
+[[example]]
+name = "shogi_aux_canonical"
+path = "../../examples/shogi_aux_canonical.rs"
+
+[[example]]
+name = "kzt_stats"
+path = "../../examples/kzt_stats.rs"
+
+[[example]]
+name = "p4h2_crosstab"
+path = "../../examples/p4h2_crosstab.rs"
+
+[[example]]
+name = "bucket_cp_crosstab"
+path = "../../examples/bucket_cp_crosstab.rs"
+
+[[example]]
+name = "arh_fixture_dump"
+path = "../../examples/arh_fixture_dump.rs"
+
+[[example]]
+name = "shogi_layerstack_policy"
+path = "../../examples/shogi_layerstack_policy.rs"
+
+[[example]]
+name = "shogi_layerstack_policy_v2"
+path = "../../examples/shogi_layerstack_policy_v2.rs"
+
+[[example]]
+name = "shogi_layerstack_policy_v10_soft"
+path = "../../examples/shogi_layerstack_policy_v10_soft.rs"
+
+[[example]]
+name = "shogi_layerstack_policy_v10_soft_swiglu"
+path = "../../examples/shogi_layerstack_policy_v10_soft_swiglu.rs"
+
+[[example]]
+name = "shogi_layerstack_policy_v11_silu_swiglu"
+path = "../../examples/shogi_layerstack_policy_v11_silu_swiglu.rs"
+
+[[example]]
+name = "shogi_layerstack_policy_v12_silu_swiglu_rms"
+path = "../../examples/shogi_layerstack_policy_v12_silu_swiglu_rms.rs"
+
+[[example]]
+name = "shogi_layerstack_policy_v13_silu_swiglu_ph2048"
+path = "../../examples/shogi_layerstack_policy_v13_silu_swiglu_ph2048.rs"
+
+[[example]]
+name = "shogi_layerstack_policy_v14_value_focus"
+path = "../../examples/shogi_layerstack_policy_v14_value_focus.rs"
+
+[[example]]
+name = "shogi_layerstack_policy_v15_leaky_value"
+path = "../../examples/shogi_layerstack_policy_v15_leaky_value.rs"
+
+[[example]]
+name = "shogi_layerstack_policy_v16_compact_leaky"
+path = "../../examples/shogi_layerstack_policy_v16_compact_leaky.rs"
+
+[[example]]
+name = "shogi_layerstack_policy_v17_linear_wdl"
+path = "../../examples/shogi_layerstack_policy_v17_linear_wdl.rs"
+
+[[example]]
+name = "shogi_layerstack_value_v20_clean"
+path = "../../examples/shogi_layerstack_value_v20_clean.rs"
+
+[[example]]
+name = "crcl_resnet_psv_train"
+path = "../../examples/crcl_resnet_psv_train.rs"
+required-features = ["cuda"]
+
+[[example]]
+name = "crcl_resnet_psv_train_policy"
+path = "../../examples/crcl_resnet_psv_train_policy.rs"
+required-features = ["cuda"]
+
+[[example]]
+name = "crcl_resnet_psv_train_policy_onehot"
+path = "../../examples/crcl_resnet_psv_train_policy_onehot.rs"
+required-features = ["cuda"]
+
+[[example]]
+name = "debug_psv_max_active"
+path = "../../examples/debug_psv_max_active.rs"
+
+[[example]]
+name = "arh_v2_alpha_dist"
+path = "../../examples/arh_v2_alpha_dist.rs"
+
+[[example]]
+name = "crcl_ptq"
+path = "../../examples/crcl_ptq.rs"
+
+[[example]]
+name = "psv_dedup"
+path = "../../examples/psv_dedup.rs"
+
+[[example]]
+name = "psv_dedup_external"
+path = "../../examples/psv_dedup_external.rs"
+
+[[example]]
+name = "shogi_halfka_policy_value_only"
+path = "../../examples/shogi_halfka_policy_value_only.rs"
+
+[[example]]
+name = "debug_halfka_direct"
+path = "../../examples/debug_halfka_direct.rs"
+
+[[example]]
+name = "debug_halfka_policy_input"
+path = "../../examples/debug_halfka_policy_input.rs"
+
+[[example]]
+name = "debug_radam_4layer"
+path = "../../examples/debug_radam_4layer.rs"
+
+[[example]]
+name = "debug_adamw_crelu"
+path = "../../examples/debug_adamw_crelu.rs"
 
 [[example]]
 name = "shogi_layerstack_eval"
@@ -95,14 +274,9 @@ path = "../../examples/shogi_bucket_survey.rs"
 name = "shogi_progress_kpabs_train"
 path = "../../examples/shogi_progress_kpabs_train.rs"
 
-[[example]]
-name = "compare_progress_buckets"
-path = "../../examples/compare_progress_buckets.rs"
-
-[[example]]
-name = "merge_scores"
-path = "../../examples/merge_scores.rs"
-
+# 2026-09-02: compare_progress_buckets / merge_scores の宣言を削除した。
+# 実体 (examples/*.rs) がリポジトリ内のどこにも存在せず、 target resolution error で
+# `cargo test` / `cargo fmt` がワークスペース全体で起動できなくなっていたため。
 [[example]]
 name = "compilation"
 path = "../../examples/extra/compilation.rs"
@@ -116,5 +290,61 @@ name = "scan_bad_records"
 path = "../../examples/scan_bad_records.rs"
 
 [[example]]
+name = "threat_profile_subset"
+path = "../../examples/threat_profile_subset.rs"
+
+[[example]]
 name = "recover_experiment"
 path = "../../examples/recover_experiment.rs"
+
+
+[[example]]
+name = "shogi_auxcheap_canonical"
+path = "../../examples/shogi_auxcheap_canonical.rs"
+
+[[example]]
+name = "bench_auxcheap_emit"
+path = "../../examples/bench_auxcheap_emit.rs"
+
+[[example]]
+name = "psv_checkmate_probe"
+path = "../../examples/psv_checkmate_probe.rs"
+
+[[example]]
+name = "psv_partition_filter"
+path = "../../examples/psv_partition_filter.rs"
+
+[[example]]
+name = "build_profile15_multisource_exact"
+path = "../../examples/build_profile15_multisource_exact.rs"
+
+[[example]]
+name = "append_profile15_remaining"
+path = "../../examples/append_profile15_remaining.rs"
+
+[[example]]
+name = "count_profile15_categories"
+path = "../../examples/count_profile15_categories.rs"
+
+[[example]]
+name = "append_late_from_novel_ext3"
+path = "../../examples/append_late_from_novel_ext3.rs"
+
+[[example]]
+name = "audit_profile15_overlap"
+path = "../../examples/audit_profile15_overlap.rs"
+
+# 右玉焼き込みの検算用 (2026-10-18)。 python 実装と score を突き合わせる
+[[example]]
+name = "migi_bake_verify"
+path = "../../examples/migi_bake_verify.rs"
+
+# KH ブロック (玉近傍の空升 x 敵の利き / 浮き駒) の検算用 (2026-11-12)。 runs/sibling/kh_verify.py と突き合わせる
+[[example]]
+name = "kh_feat_dump"
+path = "../../examples/kh_feat_dump.rs"
+
+# 序盤帯などの bucket 範囲だけを PSV から抜き出す (2026-11-13)。 bucket は学習器と同じ ShogiProgressKPAbs
+[[example]]
+name = "psv_bucket_filter"
+path = "../../examples/psv_bucket_filter.rs"

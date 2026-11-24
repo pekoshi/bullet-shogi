@@ -1,6 +1,7 @@
 use crate::device::operation::{AdamConfig, BaseOperations, DiffableFromOutput};
 
 use super::{CpuBuffer, CpuError};
+use crate::device::operation::Ranger21Config;
 
 impl BaseOperations for CpuBuffer<f32> {
     type BaseError = CpuError;
@@ -11,6 +12,18 @@ impl BaseOperations for CpuBuffer<f32> {
         }
 
         for i in self.buf.iter_mut().take(size) {
+            *i = val;
+        }
+
+        Ok(())
+    }
+
+    fn set_range_to(&mut self, start: usize, end: usize, val: f32) -> Result<(), Self::BaseError> {
+        if start > end || end > self.buf.len() {
+            return Err(CpuError);
+        }
+
+        for i in &mut self.buf[start..end] {
             *i = val;
         }
 
@@ -36,6 +49,7 @@ impl BaseOperations for CpuBuffer<f32> {
             DiffableFromOutput::SCReLU => apply(size, a, self, |x| x.clamp(0.0, 1.0).powi(2)),
             DiffableFromOutput::SqrReLU => apply(size, a, self, |x| x.max(0.0).powi(2)),
             DiffableFromOutput::Sigmoid => apply(size, a, self, |x| 1.0 / (1.0 + (-x).exp())),
+            DiffableFromOutput::LeakyReLU => apply(size, a, self, |x| if x > 0.0 { x } else { 0.01 * x }),
         }
 
         Ok(())
@@ -72,6 +86,7 @@ impl BaseOperations for CpuBuffer<f32> {
                 let sig = 1.0 / (1.0 + (-x).exp());
                 sig * (1.0 - sig)
             }),
+            DiffableFromOutput::LeakyReLU => apply(size, a, grd, self, |x| if x > 0.0 { 1.0 } else { 0.01 }),
         }
 
         Ok(())
@@ -159,6 +174,148 @@ impl BaseOperations for CpuBuffer<f32> {
             *ig += og * if i > 0.0 { err } else { -err };
         }
 
+        Ok(())
+    }
+
+    fn silu_fwd(&mut self, size: usize, input: &Self) -> Result<(), Self::BaseError> {
+        for (o, &x) in self.buf[..size].iter_mut().zip(input.buf[..size].iter()) {
+            let sig = 1.0 / (1.0 + (-x).exp());
+            *o = x * sig;
+        }
+
+        Ok(())
+    }
+
+    fn silu_bwd(&mut self, size: usize, input: &Self, output_grad: &Self) -> Result<(), Self::BaseError> {
+        for ((ig, &og), &x) in
+            self.buf[..size].iter_mut().zip(output_grad.buf[..size].iter()).zip(input.buf[..size].iter())
+        {
+            let sig = 1.0 / (1.0 + (-x).exp());
+            let deriv = sig * (1.0 + x * (1.0 - sig));
+            *ig += deriv * og;
+        }
+
+        Ok(())
+    }
+
+    fn rms_norm_fwd(
+        &mut self,
+        feature_size: usize,
+        batch_size: usize,
+        eps: f32,
+        input: &Self,
+    ) -> Result<(), Self::BaseError> {
+        if feature_size == 0 {
+            return Err(CpuError);
+        }
+        for sample in 0..batch_size {
+            let off = sample * feature_size;
+            let xs = &input.buf[off..off + feature_size];
+            let mut sum_sq = 0.0f32;
+            for &x in xs {
+                sum_sq += x * x;
+            }
+            let mean_sq = sum_sq / feature_size as f32;
+            let rms_inv = 1.0 / (mean_sq + eps).sqrt();
+            let ys = &mut self.buf[off..off + feature_size];
+            for (y, &x) in ys.iter_mut().zip(xs.iter()) {
+                *y = x * rms_inv;
+            }
+        }
+        Ok(())
+    }
+
+    fn rms_norm_bwd(
+        &mut self,
+        feature_size: usize,
+        batch_size: usize,
+        eps: f32,
+        input: &Self,
+        output_grad: &Self,
+    ) -> Result<(), Self::BaseError> {
+        if feature_size == 0 {
+            return Err(CpuError);
+        }
+        let n_f = feature_size as f32;
+        for sample in 0..batch_size {
+            let off = sample * feature_size;
+            let xs = &input.buf[off..off + feature_size];
+            let gs = &output_grad.buf[off..off + feature_size];
+
+            let mut sum_sq = 0.0f32;
+            let mut dot_gx = 0.0f32;
+            for (&x, &g) in xs.iter().zip(gs.iter()) {
+                sum_sq += x * x;
+                dot_gx += g * x;
+            }
+            let mean_sq = sum_sq / n_f;
+            let rms = (mean_sq + eps).sqrt();
+            let rms_inv = 1.0 / rms;
+            let coef = dot_gx / (n_f * rms * rms * rms);
+
+            let igs = &mut self.buf[off..off + feature_size];
+            for (ig, (&x, &g)) in igs.iter_mut().zip(xs.iter().zip(gs.iter())) {
+                *ig += g * rms_inv - x * coef;
+            }
+        }
+        Ok(())
+    }
+
+    fn softmax_fwd(&mut self, feature_size: usize, batch_size: usize, input: &Self) -> Result<(), Self::BaseError> {
+        if feature_size == 0 {
+            return Err(CpuError);
+        }
+        for sample in 0..batch_size {
+            let off = sample * feature_size;
+            let xs = &input.buf[off..off + feature_size];
+
+            let mut max_v = xs[0];
+            for &x in xs.iter().skip(1) {
+                if x > max_v {
+                    max_v = x;
+                }
+            }
+
+            let mut sum_exp = 0.0f32;
+            let ys = &mut self.buf[off..off + feature_size];
+            for (y, &x) in ys.iter_mut().zip(xs.iter()) {
+                let e = (x - max_v).exp();
+                *y = e;
+                sum_exp += e;
+            }
+            let inv = 1.0 / sum_exp;
+            for y in ys.iter_mut() {
+                *y *= inv;
+            }
+        }
+        Ok(())
+    }
+
+    fn softmax_bwd(
+        &mut self,
+        feature_size: usize,
+        batch_size: usize,
+        softmax_out: &Self,
+        output_grad: &Self,
+    ) -> Result<(), Self::BaseError> {
+        if feature_size == 0 {
+            return Err(CpuError);
+        }
+        for sample in 0..batch_size {
+            let off = sample * feature_size;
+            let ys = &softmax_out.buf[off..off + feature_size];
+            let gs = &output_grad.buf[off..off + feature_size];
+
+            let mut dot_yg = 0.0f32;
+            for (&y, &g) in ys.iter().zip(gs.iter()) {
+                dot_yg += y * g;
+            }
+
+            let igs = &mut self.buf[off..off + feature_size];
+            for (ig, (&y, &g)) in igs.iter_mut().zip(ys.iter().zip(gs.iter())) {
+                *ig += y * (g - dot_yg);
+            }
+        }
         Ok(())
     }
 
@@ -280,27 +437,6 @@ impl BaseOperations for CpuBuffer<f32> {
         Ok(())
     }
 
-    fn clip_with_repeated_offset(
-        &mut self,
-        rows: usize,
-        cols: usize,
-        offset: &Self,
-        offset_rows: usize,
-        offset_cols: usize,
-        min: f32,
-        max: f32,
-    ) -> Result<(), Self::BaseError> {
-        for col in 0..cols {
-            for row in 0..rows {
-                let idx = col * rows + row;
-                let shared = offset.buf[(col % offset_cols) * offset_rows + (row % offset_rows)];
-                self.buf[idx] = (self.buf[idx] + shared).clamp(min, max) - shared;
-            }
-        }
-
-        Ok(())
-    }
-
     fn adam(
         &mut self,
         config: &AdamConfig,
@@ -331,6 +467,55 @@ impl BaseOperations for CpuBuffer<f32> {
 
             if let Some((min, max)) = clip {
                 *p = (*p).clamp(min, max);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn ranger21(
+        &mut self,
+        config: &Ranger21Config,
+        offset: usize,
+        size: usize,
+        grd: &Self,
+        momentum: &mut Self,
+        velocity: &mut Self,
+        max_velocity: &mut Self,
+    ) -> Result<(), Self::BaseError> {
+        let end = offset + size;
+        let Ranger21Config {
+            beta0,
+            beta1_sq,
+            beta2,
+            gradient_factor,
+            step_size,
+            inv_sqrt_bias_correction2,
+            eps,
+            decay,
+            min_weight,
+            max_weight,
+            clamp_weights,
+        } = *config;
+        for ((((p, &g), momentum), velocity), max_velocity) in self.buf[offset..end]
+            .iter_mut()
+            .zip(grd.buf[offset..end].iter())
+            .zip(momentum.buf[offset..end].iter_mut())
+            .zip(velocity.buf[offset..end].iter_mut())
+            .zip(max_velocity.buf[offset..end].iter_mut())
+        {
+            *p *= decay;
+            let grad = gradient_factor * g;
+            let old_momentum = *momentum;
+            let new_momentum = beta1_sq * old_momentum + (1.0 - beta1_sq) * grad;
+            *momentum = new_momentum;
+            *velocity = beta2 * *velocity + (1.0 - beta2) * grad * grad;
+            *max_velocity = (*max_velocity).max(*velocity);
+            let pnm = (1.0 + beta0) * new_momentum - beta0 * old_momentum;
+            let denom = (*max_velocity).sqrt() * inv_sqrt_bias_correction2 + eps;
+            *p -= step_size * pnm / denom;
+            if clamp_weights {
+                *p = (*p).clamp(min_weight, max_weight);
             }
         }
 

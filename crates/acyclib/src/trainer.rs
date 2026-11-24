@@ -132,13 +132,37 @@ impl<D: Device, G: GraphLike<D>, O: OptimiserState<D>, S> Trainer<D, G, O, S> {
                 gradient_factor: f32,
                 learning_rate: f32,
             ) -> Result<(), OperationError<D::DeviceError>> {
-                optim.run_batch_start_updates()?;
+                let diagnose = std::env::var_os("BULLET_DIAG_STEP").is_some();
+                if diagnose {
+                    eprintln!("ranger21-diag: zero_grads.begin");
+                }
                 optim.graph.execute_fn("zero_grads")?;
+                if diagnose {
+                    eprintln!("ranger21-diag: zero_grads.ok");
+                }
+                if diagnose {
+                    eprintln!("ranger21-diag: forward.begin");
+                }
                 optim.graph.execute_fn("forward")?;
+                if diagnose {
+                    eprintln!("ranger21-diag: forward.ok");
+                }
+                if diagnose {
+                    eprintln!("ranger21-diag: backward.begin");
+                }
                 optim.graph.execute_fn("backward")?;
-                optim.update(gradient_factor, learning_rate)
+                if diagnose {
+                    eprintln!("ranger21-diag: backward.ok");
+                }
+                if diagnose {
+                    eprintln!("ranger21-diag: update.begin");
+                }
+                optim.update(gradient_factor, learning_rate)?;
+                if diagnose {
+                    eprintln!("ranger21-diag: update.ok");
+                }
+                Ok(())
             }
-
             step(&mut self.optimiser, gf, lrate).map_err(TrainerError::GradientCalculationError)?;
 
             if let Ok(next_batch) = receiver.recv() {

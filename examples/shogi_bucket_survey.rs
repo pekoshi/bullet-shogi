@@ -20,7 +20,7 @@ use bullet_lib::{
     game::outputs::{
         OutputBuckets, SHOGI_PROGRESS_GIKOU_LITE_FEATURE_ORDER, SHOGI_PROGRESS_GIKOU_LITE_NUM_FEATURES,
         SHOGI_PROGRESS8_FEATURE_ORDER, SHOGI_PROGRESS8_NUM_FEATURES, ShogiKingRankBucket, ShogiProgressBucket8,
-        ShogiProgressBucket8GikouLite, ShogiProgressKPAbs,
+        ShogiProgressBucket8GikouLite, ShogiProgressKPAbs, weighted_hand_total,
     },
     shogi::{Color, PackedSfenValue, ShogiBoard},
 };
@@ -272,6 +272,160 @@ fn print_hist(name: &str, hist: &[usize]) {
 
     let max_share = 100.0 * (max_count as f64) / (total as f64);
     println!("top bucket: {} ({:.2}%)", max_bucket, max_share);
+}
+
+/// ソート済スライスから分位点(0.0..=1.0)を取得(nearest-rank)。
+fn quantile_sorted(sorted: &[i32], q: f64) -> i32 {
+    if sorted.is_empty() {
+        return 0;
+    }
+    let idx = ((q * (sorted.len() as f64 - 1.0)).round() as usize).min(sorted.len() - 1);
+    sorted[idx]
+}
+
+/// 偶数への丸め(最近接偶数)。
+fn round_to_even(v: f64) -> i32 {
+    let r = (v / 2.0).round() * 2.0;
+    r as i32
+}
+
+/// P4H2 LayerStack の分布解析(進行度4区分 × 持駒量2区分)。
+///
+/// - 進行度4区分ごとの局面数 / total_hand_value 分位点・ヒストグラム
+/// - 固定閾値 sweep (6/8/10/12/14/16) での 8 stack 分布(案A: 全進行度共通閾値)
+/// - 案B: 進行度別閾値(= 各進行度の中央値を偶数丸め)での 8 stack 分布と少/多比率
+/// - A/B の最小 stack 局面数比較
+fn print_p4h2_analysis(hand_by_prog4: &mut [Vec<i32>; 4]) {
+    println!("\n================ P4H2 LayerStack 分布解析 ================");
+    let total_samples: usize = hand_by_prog4.iter().map(|v| v.len()).sum();
+    if total_samples == 0 {
+        println!("(no KPAbs samples — --progress-kpabs 未指定か 0 件)");
+        return;
+    }
+
+    // 各進行度をソート(分位点算出用)。
+    for v in hand_by_prog4.iter_mut() {
+        v.sort_unstable();
+    }
+
+    // (1)(4)(5) 進行度4区分ごとの局面数と分位点。
+    println!("\n-- (1) 進行度4区分ごとの局面数 / (4)(5) total_hand_value 分位点 --");
+    println!(
+        "{:>5} {:>10} {:>7} {:>5} {:>5} {:>5} {:>5} {:>5} {:>7}",
+        "prog4", "count", "share%", "min", "p25", "p50", "p75", "max", "mean"
+    );
+    let mut medians = [0i32; 4];
+    for (p, v) in hand_by_prog4.iter().enumerate() {
+        if v.is_empty() {
+            println!("{p:>5} {:>10} (空)", 0);
+            continue;
+        }
+        let p50 = quantile_sorted(v, 0.50);
+        medians[p] = p50;
+        let mean = v.iter().map(|&x| x as f64).sum::<f64>() / v.len() as f64;
+        println!(
+            "{:>5} {:>10} {:>6.2}% {:>5} {:>5} {:>5} {:>5} {:>5} {:>7.2}",
+            p,
+            v.len(),
+            100.0 * v.len() as f64 / total_samples as f64,
+            v[0],
+            quantile_sorted(v, 0.25),
+            p50,
+            quantile_sorted(v, 0.75),
+            v[v.len() - 1],
+            mean,
+        );
+    }
+
+    // (2) 進行度ごとの total_hand_value ヒストグラム(0..=30 と 31+ に集約)。
+    println!("\n-- (2) 進行度ごとの total_hand_value ヒストグラム (0..30, 31+) --");
+    for (p, v) in hand_by_prog4.iter().enumerate() {
+        if v.is_empty() {
+            continue;
+        }
+        let mut hist = [0usize; 32]; // index 31 = 31 以上
+        for &x in v {
+            let idx = (x.max(0) as usize).min(31);
+            hist[idx] += 1;
+        }
+        print!("prog4={p}:");
+        for (val, &c) in hist.iter().enumerate() {
+            if c > 0 {
+                let label = if val == 31 { "31+".to_string() } else { val.to_string() };
+                print!(" {label}={c}");
+            }
+        }
+        println!();
+    }
+
+    // (3) 固定閾値 sweep での 8 stack 分布(案A)。
+    let sweep = [6i32, 8, 10, 12, 14, 16];
+    println!("\n-- (3) 案A: 全進行度共通の固定閾値 sweep での 8 stack 分布 --");
+    println!("   stack = prog4*2 + (total>=thr ? 1 : 0)  [偶数stack=少, 奇数stack=多]");
+    for thr in sweep {
+        let mut stacks = [0usize; 8];
+        for (p, v) in hand_by_prog4.iter().enumerate() {
+            for &x in v {
+                let hand2 = usize::from(x >= thr);
+                stacks[p * 2 + hand2] += 1;
+            }
+        }
+        let min_stack = *stacks.iter().min().unwrap();
+        print!("thr={thr:>2}:");
+        for (i, &c) in stacks.iter().enumerate() {
+            print!(" s{i}={c}({:.1}%)", 100.0 * c as f64 / total_samples as f64);
+        }
+        println!("  min_stack={min_stack} ({:.2}%)", 100.0 * min_stack as f64 / total_samples as f64);
+        // 各進行度内の 少:多 比率(案A の不均衡診断)。
+        print!("        per-prog4 少:多 =");
+        for v in hand_by_prog4.iter() {
+            if v.is_empty() {
+                print!(" -");
+                continue;
+            }
+            let high = v.iter().filter(|&&x| x >= thr).count();
+            let low = v.len() - high;
+            print!(" {:.0}:{:.0}", 100.0 * low as f64 / v.len() as f64, 100.0 * high as f64 / v.len() as f64);
+        }
+        println!();
+    }
+
+    // 案B: 進行度別閾値 = 各進行度の中央値を偶数丸め。
+    let mut thr_b = [0i32; 4];
+    for p in 0..4 {
+        thr_b[p] = round_to_even(medians[p] as f64);
+    }
+    println!("\n-- 案B: 進行度別閾値(= 各進行度中央値の偶数丸め)での 8 stack 分布 --");
+    println!("   thr_b(prog4=0..3) = {thr_b:?}");
+    {
+        let mut stacks = [0usize; 8];
+        for (p, v) in hand_by_prog4.iter().enumerate() {
+            for &x in v {
+                let hand2 = usize::from(x >= thr_b[p]);
+                stacks[p * 2 + hand2] += 1;
+            }
+        }
+        let min_stack_b = *stacks.iter().min().unwrap();
+        print!("案B:");
+        for (i, &c) in stacks.iter().enumerate() {
+            print!(" s{i}={c}({:.1}%)", 100.0 * c as f64 / total_samples as f64);
+        }
+        println!("  min_stack={min_stack_b} ({:.2}%)", 100.0 * min_stack_b as f64 / total_samples as f64);
+        print!("     per-prog4 少:多 =");
+        for (p, v) in hand_by_prog4.iter().enumerate() {
+            if v.is_empty() {
+                print!(" -");
+                continue;
+            }
+            let high = v.iter().filter(|&&x| x >= thr_b[p]).count();
+            let low = v.len() - high;
+            print!(" {:.0}:{:.0}", 100.0 * low as f64 / v.len() as f64, 100.0 * high as f64 / v.len() as f64);
+        }
+        println!();
+    }
+    println!("\n判定目安: 各進行度内の 少:多 が 35:65〜65:35 に収まるか。");
+    println!("案A(共通閾値)で偏るなら案B採用。案B閾値配列は engine/bullet 共通定数化し arch hash に反映する。");
+    println!("==========================================================");
 }
 
 fn top_bucket_info(hist: &[usize]) -> (usize, f64) {
@@ -630,6 +784,9 @@ fn main() {
     let mut hist_progress8 = vec![0usize; 8];
     let mut hist_progress8_gikou = vec![0usize; 8];
     let mut hist_progress8_kpabs = vec![0usize; 8];
+    // P4H2 分布解析: progress_bucket4(0..3) ごとに weighted_hand_total を収集し、
+    // 閾値ごとの 8 stack 分布・分位点・ヒストグラムを事後に算出する。
+    let mut p4h2_hand_by_prog4: [Vec<i32>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
     let mut per_pack_samples = vec![0usize; packs.len()];
     let mut per_pack_kingrank = vec![vec![0usize; 9]; packs.len()];
     let mut per_pack_progress8 = progress_bucket.map(|_| vec![vec![0usize; 8]; packs.len()]);
@@ -672,6 +829,9 @@ fn main() {
             if let Some(per_pack) = per_pack_progress8_kpabs.as_mut() {
                 per_pack[pack_idx][b] += 1;
             }
+            // P4H2 分布: progress_bucket4 = b/2 ごとに weighted_hand_total を蓄積。
+            let prog4 = b / 2; // 0..3
+            p4h2_hand_by_prog4[prog4].push(weighted_hand_total(&s.psv));
         }
     }
 
@@ -689,6 +849,7 @@ fn main() {
     }
     if progress_bucket_kpabs.is_some() {
         print_hist("Candidate F: Progress8 KPAbs (logistic)", &hist_progress8_kpabs);
+        print_p4h2_analysis(&mut p4h2_hand_by_prog4);
     }
     print_hist("Candidate B: (Ply Quantile 3) x (FriendKingZone 3)", &hist_hybrid);
 

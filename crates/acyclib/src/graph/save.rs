@@ -49,6 +49,14 @@ impl GraphWeights {
         self.stores.get(id).cloned().unwrap()
     }
 
+    /// 2026-06-10 追加: id 存在チェック (= panic-safe な前段確認用)。
+    /// `SavedFormat::transform` closure 内で graph に登録されない可能性がある weight
+    /// (= 訓練中の特定 trigger で graph store から除外される tensor 等) を扱う際に
+    /// 使う。 ARH / KED 等の section transform で利用。
+    pub fn has(&self, id: &str) -> bool {
+        self.stores.contains_key(id)
+    }
+
     #[deprecated(note = "Use `.get` instead!")]
     pub fn get_weights(&self, id: &str) -> TensorStore {
         self.get(id)

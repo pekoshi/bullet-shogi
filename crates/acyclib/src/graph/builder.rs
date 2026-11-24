@@ -12,21 +12,21 @@ use std::{
 use crate::{
     dag::NodeId,
     device::{
+        Device,
         function::Reduce,
         multi::{MultiDevice, MultiDeviceComm},
-        tensor::{rng, Shape},
-        Device,
+        tensor::Shape,
     },
     graph::{
+        Graph, GraphNodeId, GraphNodeIdTy,
         ir::{
+            BackendMarker, GraphIRManager,
             operation::{
-                binary::Select, sparse::SparseAffineActivate, unary::ReduceAcrossBatch, GraphIROperationCompilable,
+                GraphIROperationCompilable, binary::Select, sparse::SparseAffineActivate, unary::ReduceAcrossBatch,
             },
             passes::GraphIRPass,
-            BackendMarker, GraphIRManager,
         },
         multi::MultiDeviceGraph,
-        Graph, GraphNodeId, GraphNodeIdTy,
     },
 };
 
@@ -35,7 +35,6 @@ pub enum InitSettings {
     Zeroed,
     Normal { mean: f32, stdev: f32 },
     Uniform { mean: f32, stdev: f32 },
-    RepeatedUniform { mean: f32, stdev: f32, rows_per_bucket: usize, buckets: usize },
 }
 
 #[derive(Default)]
@@ -94,6 +93,14 @@ impl<B: BackendMarker> GraphBuilder<B> {
 
     pub fn new_weights<'a>(&'a self, id: &str, shape: Shape, init: InitSettings) -> GraphBuilderNode<'a, B> {
         let node = self.ir().add_weights(id, shape).unwrap();
+        self.init().insert(id.to_string(), init);
+        GraphBuilderNode { node, builder: self }
+    }
+
+    /// **勾配を持たない重み** (真の凍結)。 `new_weights` と同じで `add_weights_frozen` を呼ぶだけ。
+    ///   2026-11-03 / 詳細は `GraphIR::add_weights_frozen`
+    pub fn new_weights_frozen<'a>(&'a self, id: &str, shape: Shape, init: InitSettings) -> GraphBuilderNode<'a, B> {
+        let node = self.ir().add_weights_frozen(id, shape).unwrap();
         self.init().insert(id.to_string(), init);
         GraphBuilderNode { node, builder: self }
     }
@@ -184,21 +191,6 @@ where
                     .dense_mut()
                     .seed_random(mean, stdev, false)
                     .unwrap(),
-                InitSettings::RepeatedUniform { mean, stdev, rows_per_bucket, buckets } => {
-                    let weights =
-                        graph.get(GraphNodeId::new(graph.weight_idx(id).unwrap(), GraphNodeIdTy::Values)).unwrap();
-                    let mut weights = weights.dense_mut();
-                    let size = weights.size();
-                    let repeated_rows = rows_per_bucket * buckets;
-                    assert_eq!(size % repeated_rows, 0, "RepeatedUniform tensor size must divide by repeated rows");
-                    let cols = size / repeated_rows;
-                    let bucket_values = rng::vec_f32(rows_per_bucket * cols, mean, stdev, false);
-                    let mut values = Vec::with_capacity(size);
-                    for _ in 0..buckets {
-                        values.extend_from_slice(&bucket_values);
-                    }
-                    weights.load_from_slice(None, &values).unwrap();
-                }
             };
         }
 
